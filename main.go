@@ -16,12 +16,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/pkg/console"
@@ -112,12 +119,75 @@ func checkMain(ctx *cli.Context) {
 	}
 }
 
+type resultMsg struct {
+	result testResult
+}
+
+func (m resultMsg) JSON() string {
+	buf := &bytes.Buffer{}
+	enc := json.NewEncoder(buf)
+	enc.SetIndent("", " ")
+	// Disable escaping special chars to display XML tags correctly
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(m); err != nil {
+		console.Fatalln(fmt.Errorf("Unable to marshal into JSON %w", err))
+	}
+	return buf.String()
+}
+
+type testResult struct {
+	method   string
+	funcName string
+	path     string
+	node     string
+	err      error
+}
+type resultsModel struct {
+	spinner   spinner.Model
+	numTests  int
+	numFailed int
+	Failures  []testResult
+	duration  time.Duration
+}
+
+func initUI(duration time.Duration) *resultsModel {
+	s := spinner.New()
+	s.Spinner = spinner.Points
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	console.SetColor("duration", color.New(color.FgHiWhite))
+	console.SetColor("path", color.New(color.FgGreen))
+	console.SetColor("error", color.New(color.FgHiRed))
+	console.SetColor("title", color.New(color.FgCyan))
+	console.SetColor("node", color.New(color.FgCyan))
+	return &resultsModel{
+		spinner:  s,
+		duration: duration,
+	}
+}
+
+var testOpts struct {
+	duration time.Duration
+}
+
 func monkeyconMain(ctx *cli.Context) {
 	checkMain(ctx)
 	ctxt, cancelFn := context.WithCancel(context.Background())
 	defer cancelFn()
-	// initUI()
 	nodeState := configureClients(ctx)
+	ui := tea.NewProgram(initUI(ctx.Duration("max-paths")))
+	go func() {
+		e := runTests(ctxt, opts, func(res testResult) {
+			if globalJSON {
+				printMsg(resultMsg{result: res})
+				return
+			}
+			ui.Send(res)
+		})
+		if e != nil && !errors.Is(e, context.Canceled) {
+			console.Fatalln(fmt.Errorf("Unable to run monkeycon: %w", e))
+		}
+	}()
+
 	// this is just to test the healthcheck ping
 	//todo: remove this code:begin
 	hcTimer := time.NewTimer(15 * time.Second)
