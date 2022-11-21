@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lithammer/shortuuid/v4"
@@ -32,42 +33,51 @@ func statOp(concurrency bool, verifier ObjVerifier) Op {
 	return op
 }
 func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (err error) {
-	ctx2, cancel := context.WithDeadline(context.Background(), time.Now().Add(n.cliCtx.Duration("duration")))
-	defer cancel()
+	var ctx2 = ctx
+	if n.cliCtx.IsSet("duration") {
+		var cancel context.CancelFunc
+		ctx2, cancel = context.WithDeadline(context.Background(), time.Now().Add(n.cliCtx.Duration("duration")))
+		defer cancel()
+	}
 	for {
 		select {
 		case <-ctx2.Done():
+			outFn(testResult{
+				Final: true,
+			})
 			return
 		default:
 			resCh := n.runConcurrent(ctx2, putOp(true))
-			for r := range resCh {
-				res := r.(PutOpResult)
+			for res := range resCh {
+				r := res.(PutOpResult)
 				outFn(testResult{
-					Method: string(res.r.op),
-					Path:   fmt.Sprintf("%s/%s", res.data.Bucket, res.data.Key),
-					Node:   n.nodes[res.r.nodeIdx].endpointURL.Host,
-					Err:    res.r.err,
+					Method: string(r.op),
+					Path:   fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
+					Node:   n.nodes[r.nodeIdx].endpointURL.Host,
+					Err:    r.err,
 				})
+				n.buf.objects = append(n.buf.objects, Object{Key: r.data.Key, VersionID: r.data.VersionID})
+				atomic.AddUint32(&n.bIdx, 1)
 				getCh := n.runConcurrent(ctx2, getOp(true, ObjVerifier{ObjectInfo: minio.ObjectInfo{
-					ETag: res.data.ETag,
-					Key:  res.data.Key,
+					ETag: r.data.ETag,
+					Key:  r.data.Key,
 				}}))
 				for gr := range getCh {
 					res := gr.(GetOpResult)
 					outFn(testResult{
-						Method: string(res.r.op),
-						Path:   fmt.Sprintf("%s/%s", res.r.bucket, res.data.Key),
-						Node:   n.nodes[res.r.nodeIdx].endpointURL.Host,
-						Err:    res.r.err,
+						Method: string(r.op),
+						Path:   fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
+						Node:   n.nodes[r.nodeIdx].endpointURL.Host,
+						Err:    r.err,
 					})
 					statCh := n.runConcurrent(ctx2, statOp(true, ObjVerifier{ObjectInfo: res.data}))
 					for sres := range statCh {
-						res := sres.(GetOpResult)
+						r := sres.(StatOpResult)
 						outFn(testResult{
-							Method: string(res.r.op),
-							Path:   fmt.Sprintf("%s/%s", res.r.bucket, res.data.Key),
-							Node:   n.nodes[res.r.nodeIdx].endpointURL.Host,
-							Err:    res.r.err,
+							Method: string(r.op),
+							Path:   fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
+							Node:   n.nodes[r.nodeIdx].endpointURL.Host,
+							Err:    r.err,
 						})
 					}
 				}
@@ -107,23 +117,38 @@ func (n *nodeState) runConcurrent(ctx context.Context, op Op) chan OpResult {
 				defer wg.Done()
 				switch op.Type {
 				case http.MethodPut:
-					resCh <- n.put(ctx, putOpts{
+					select {
+					case resCh <- n.put(ctx, putOpts{
 						Bucket:  bucket,
 						Object:  fmt.Sprintf("%s/%d", shortuuid.New(), idx),
 						NodeIdx: idx,
-					})
+					}):
+					case <-ctx.Done():
+						return
+					}
+
 				case http.MethodGet:
-					resCh <- n.get(ctx, getOpts{
-						Bucket:  bucket,
-						Object:  op.Verifier.Key,
-						NodeIdx: idx,
-					})
-				// case http.MethodHead:
-				// 	resCh <- n.stat(ctx, statOpts{
-				// 		Bucket:  bucket,
-				// 		Object:  op.Verifier.Key,
-				// 		NodeIdx: idx,
-				// 	})
+					select {
+					case resCh <- n.get(ctx, getOpts{
+						Bucket:   bucket,
+						Object:   op.Verifier.Key,
+						NodeIdx:  idx,
+						Verifier: op.Verifier.ObjectInfo,
+					}):
+					case <-ctx.Done():
+						return
+					}
+				case http.MethodHead:
+					select {
+					case resCh <- n.stat(ctx, statOpts{
+						Bucket:   bucket,
+						Object:   op.Verifier.Key,
+						NodeIdx:  idx,
+						Verifier: op.Verifier.ObjectInfo,
+					}):
+					case <-ctx.Done():
+						return
+					}
 				default:
 				}
 			}(idx)
@@ -151,9 +176,7 @@ type getOpts struct {
 	Verifier minio.ObjectInfo
 }
 
-type statOpts struct {
-	getOpts
-}
+type statOpts getOpts
 
 type listOpts struct {
 	Bucket  string
@@ -170,40 +193,37 @@ type opResult struct {
 	offline bool
 	nodeIdx int
 	bucket  string
+	data    minio.ObjectInfo
 }
 type PutOpResult struct {
-	r    opResult
-	data minio.UploadInfo
+	opResult
 	opts putOpts
 }
 
 type GetOpResult struct {
-	r    opResult
-	data minio.ObjectInfo
+	opResult
 	opts getOpts
 }
 
-type StatOpResult struct {
-	GetOpResult
-}
+type StatOpResult GetOpResult
 
 func (n *nodeState) put(ctx context.Context, o putOpts) (res PutOpResult) {
 	reader := getDataReader(o.Size)
 	defer reader.Close()
 	node := n.nodes[o.NodeIdx]
 	if n.hc.isOffline(node.endpointURL) {
-		res.r.offline = true
+		res.offline = true
 		return
 	}
 	oi, err := node.client.PutObject(ctx, o.Bucket, o.Object, reader, int64(o.Size), minio.PutObjectOptions{ContentType: "binary/octet-stream"})
 	return PutOpResult{
-		r: opResult{
+		opResult: opResult{
 			op:      http.MethodPut,
 			err:     err,
 			nodeIdx: o.NodeIdx,
 			bucket:  o.Bucket,
+			data:    toObjectInfo(oi),
 		},
-		data: oi,
 		opts: o,
 	}
 }
@@ -211,7 +231,7 @@ func (n *nodeState) put(ctx context.Context, o putOpts) (res PutOpResult) {
 func (n *nodeState) get(ctx context.Context, o getOpts) (res GetOpResult) {
 	node := n.nodes[o.NodeIdx]
 	if n.hc.isOffline(node.endpointURL) {
-		res.r.offline = true
+		res.offline = true
 		return
 	}
 	opts := minio.GetObjectOptions{}
@@ -226,21 +246,20 @@ func (n *nodeState) get(ctx context.Context, o getOpts) (res GetOpResult) {
 	}
 
 	return GetOpResult{
-		r: opResult{
+		opResult: opResult{
 			op:      http.MethodGet,
 			err:     err,
 			nodeIdx: o.NodeIdx,
+			data:    oi,
 		},
-		data: oi,
 		opts: o,
 	}
 }
 
-/*
 func (n *nodeState) stat(ctx context.Context, o statOpts) (res StatOpResult) {
 	node := n.nodes[o.NodeIdx]
 	if n.hc.isOffline(node.endpointURL) {
-		res.r.offline = true
+		res.offline = true
 		return
 	}
 	opts := minio.StatObjectOptions{}
@@ -250,18 +269,31 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res StatOpResult) {
 		if oi.ETag != o.Verifier.ETag ||
 			oi.VersionID != o.Verifier.VersionID ||
 			oi.Size != o.Verifier.Size {
-			err = fmt.Errorf("metadata mismatch")
+			err = fmt.Errorf("metadata mismatch %s, %s, %s,%s, %d, %d", oi.ETag, o.Verifier.ETag, oi.VersionID, o.VersionID, oi.Size, o.Size)
 		}
 	}
 
 	return StatOpResult{
-		r: opResult{
+		opResult: opResult{
 			op:      http.MethodGet,
 			err:     err,
 			nodeIdx: o.NodeIdx,
+			data:    oi,
 		},
-		data: oi,
-		opts: o,
+		opts: getOpts(o),
 	}
 }
-*/
+
+func toObjectInfo(o minio.UploadInfo) minio.ObjectInfo {
+	return minio.ObjectInfo{
+		Key:            o.Key,
+		ETag:           o.ETag,
+		Size:           o.Size,
+		LastModified:   o.LastModified,
+		VersionID:      o.VersionID,
+		ChecksumCRC32:  o.ChecksumCRC32,
+		ChecksumCRC32C: o.ChecksumCRC32C,
+		ChecksumSHA1:   o.ChecksumSHA1,
+		ChecksumSHA256: o.ChecksumSHA256,
+	}
+}

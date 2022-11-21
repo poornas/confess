@@ -36,6 +36,8 @@ import (
 	"github.com/olekukonko/tablewriter"
 )
 
+const bufSize = 100
+
 var (
 	version                     = "0.0.0-dev"
 	globalContext, globalCancel = context.WithCancel(context.Background())
@@ -55,9 +57,24 @@ type node struct {
 type nodeState struct {
 	nodes  []*node
 	hc     *healthChecker
-	cliCtx *cli.Context // for now
+	cliCtx *cli.Context
+	buf    *objectsBuf
+	bIdx   uint32
 }
 
+type Object struct {
+	Key       string
+	VersionID string
+}
+type objectsBuf struct {
+	objects []Object
+}
+
+func newObjectsBuf() *objectsBuf {
+	return &objectsBuf{
+		objects: make([]Object, bufSize),
+	}
+}
 func main() {
 	app := cli.NewApp()
 	app.Name = os.Args[0]
@@ -102,7 +119,7 @@ func main() {
 		cli.DurationFlag{
 			Name:  "duration",
 			Usage: "Duration to run the tests. Use 's' and 'm' to specify seconds and minutes.",
-			Value: 1 * time.Minute,
+			Value: 30 * time.Second,
 		},
 	}
 	app.CustomAppHelpTemplate = `NAME:
@@ -156,6 +173,7 @@ type testResult struct {
 	Path     string `json:"path"`
 	Node     string `json:"node"`
 	Err      error  `json:"err,omitempty"`
+	Final    bool   `json:"final"`
 }
 type resultsModel struct {
 	spinner   spinner.Model
@@ -249,10 +267,10 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.numFailed++
 			m.Failures = append(m.Failures, msg)
 		}
-		// if m.Final {
-		// 	m.quitting = true
-		// 	return m, tea.Quit
-		// }
+		if msg.Final {
+			m.quitting = true
+			return m, tea.Quit
+		}
 		return m, nil
 	}
 

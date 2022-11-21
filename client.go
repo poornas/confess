@@ -159,6 +159,7 @@ func configureClients(ctx *cli.Context) *nodeState {
 	return &nodeState{
 		nodes:  nodes,
 		hc:     newHealthChecker(ctx, hcMap),
+		buf:    newObjectsBuf(),
 		cliCtx: ctx,
 	}
 }
