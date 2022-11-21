@@ -83,7 +83,6 @@ func getClient(ctx *cli.Context, hostURL *url.URL) (*minio.Client, error) {
 	default:
 		console.Fatalln(probe.NewError(errors.New("unknown signature method. S3V2 and S3V4 is available")), strings.ToUpper(ctx.String("signature")))
 	}
-
 	cl, err := minio.New(hostURL.Host, &minio.Options{
 		Creds:        creds,
 		Secure:       ctx.Bool("tls"),
@@ -157,10 +156,10 @@ func configureClients(ctx *cli.Context) *nodeState {
 			Online:   true,
 		}
 	}
-
 	return &nodeState{
-		nodes: nodes,
-		hc:    newHealthChecker(ctx, hcMap),
+		nodes:  nodes,
+		hc:     newHealthChecker(ctx, hcMap),
+		cliCtx: ctx,
 	}
 }
 
