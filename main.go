@@ -21,11 +21,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -168,21 +171,82 @@ func (m resultMsg) JSON() string {
 }
 
 type testResult struct {
-	Method   string `json:"method"`
-	FuncName string `json:"funcName"`
-	Path     string `json:"path"`
-	Node     string `json:"node"`
-	Err      error  `json:"err,omitempty"`
-	Final    bool   `json:"final"`
+	Method   string        `json:"method"`
+	FuncName string        `json:"funcName"`
+	Path     string        `json:"path"`
+	Node     string        `json:"node"`
+	Err      error         `json:"err,omitempty"`
+	Latency  time.Duration `json:"duration"`
+	Final    bool          `json:"final"`
 }
 type resultsModel struct {
-	spinner   spinner.Model
+	spinner  spinner.Model
+	progress progress.Model
+	metrics  *metrics
+	duration time.Duration
+	quitting bool
+}
+
+type opStats struct {
+	total    int
+	failures int
+	lastNode string
+	latency  time.Duration
+}
+type metrics struct {
+	startTime time.Time
+	mutex     sync.RWMutex
+	ops       map[string]opStats
 	numTests  int
 	numFailed int
 	Failures  []testResult
-	duration  time.Duration
-	quitting  bool
+	lastOp    string
 }
+
+func (m *metrics) Clone() metrics {
+	ops := make(map[string]opStats, len(m.ops))
+	for k, v := range m.ops {
+		ops[k] = v
+	}
+	var failures []testResult
+	failures = append(failures, m.Failures...)
+	return metrics{
+		numTests:  m.numTests,
+		numFailed: m.numFailed,
+		ops:       ops,
+		Failures:  failures,
+		lastOp:    m.lastOp,
+	}
+}
+func (m *metrics) Update(msg testResult) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.lastOp = msg.Method
+	stats, ok := m.ops[msg.Method]
+	if !ok {
+		stats = opStats{}
+	}
+	stats.lastNode = msg.Node
+	stats.latency = msg.Latency
+	if msg.Err != nil {
+		stats.failures++
+		m.numFailed++
+		m.Failures = append(m.Failures, msg)
+	}
+	stats.total++
+	m.ops[msg.Method] = stats
+	m.numTests++
+}
+
+type tickMsg time.Time
+
+const (
+	padding  = 0 // was 2
+	maxWidth = 80
+)
+
+var helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Render
+var titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#008080")).Render
 
 func initUI(duration time.Duration) *resultsModel {
 	s := spinner.New()
@@ -191,12 +255,24 @@ func initUI(duration time.Duration) *resultsModel {
 	console.SetColor("duration", color.New(color.FgHiWhite))
 	console.SetColor("path", color.New(color.FgGreen))
 	console.SetColor("error", color.New(color.FgHiRed))
-	console.SetColor("title", color.New(color.FgCyan))
+	console.SetColor("title", color.New(color.FgHiCyan))
 	console.SetColor("node", color.New(color.FgCyan))
+
 	return &resultsModel{
 		spinner:  s,
+		progress: progress.New(progress.WithDefaultGradient()),
 		duration: duration,
+		metrics: &metrics{
+			ops:       make(map[string]opStats),
+			Failures:  make([]testResult, 0),
+			startTime: time.Now(),
+		},
 	}
+}
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second*1, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
 }
 
 func monkeyconMain(ctx *cli.Context) {
@@ -245,7 +321,7 @@ func monkeyconMain(ctx *cli.Context) {
 }
 
 func (m *resultsModel) Init() tea.Cmd {
-	return m.spinner.Tick
+	return tea.Batch(m.spinner.Tick, tickCmd())
 }
 
 func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -262,16 +338,38 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case testResult:
-		m.numTests = m.numTests + 1
-		if msg.Err != nil {
-			m.numFailed++
-			m.Failures = append(m.Failures, msg)
-		}
+		m.metrics.Update(msg)
 		if msg.Final {
 			m.quitting = true
 			return m, tea.Quit
 		}
 		return m, nil
+	case tea.WindowSizeMsg:
+		m.progress.Width = msg.Width - padding*2 - 4
+		if m.progress.Width > maxWidth {
+			m.progress.Width = maxWidth
+		}
+		return m, nil
+
+	case tickMsg:
+		if m.progress.Percent() == 1.0 {
+			return m, tea.Quit
+		}
+
+		// Note that you can also use progress.Model.SetPercent to set the
+		// percentage value explicitly, too.
+		cmd := m.progress.IncrPercent(float64(time.Since(m.metrics.startTime) / m.duration))
+		return m, tea.Batch(tickCmd(), cmd)
+
+	// FrameMsg is sent when the progress bar wants to animate itself
+	case progress.FrameMsg:
+		progressModel, cmd := m.progress.Update(msg)
+		m.progress = progressModel.(progress.Model)
+		return m, cmd
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	}
 
 	var cmd tea.Cmd
@@ -279,13 +377,24 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+var whiteStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(lipgloss.Color("#ffffff"))
+
+func title(s string) string {
+	return titleStyle(s) //console.Colorize("title", s)
+}
+func opTitle(s string) string {
+	return titleStyle(s)
+}
 func (m *resultsModel) View() string {
 	var s strings.Builder
-
 	if !m.quitting {
 		s.WriteString(fmt.Sprintf("%s %s\n", console.Colorize("title", "Monkeycon activity:"), m.spinner.View()))
+		pad := strings.Repeat(" ", padding)
+		s.WriteString("\n" +
+			pad + m.progress.View() + "\n\n")
 	}
-
 	// Set table header
 	table := tablewriter.NewWriter(&s)
 	table.SetAutoWrapText(false)
@@ -297,17 +406,37 @@ func (m *resultsModel) View() string {
 		table.Append([]string{s})
 	}
 
-	if m.numTests == 0 {
+	var data [][]string
+
+	addLine := func(prefix string, value interface{}) {
+		data = append(data, []string{
+			prefix,
+			fmt.Sprint(value),
+		})
+	}
+
+	m.metrics.mutex.RLock()
+	metrics := m.metrics.Clone()
+	m.metrics.mutex.RUnlock()
+
+	if metrics.numTests == 0 {
 		s.WriteString("(waiting for data)")
 		return s.String()
 	}
+	addLine(title("Total Operations:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numTests, opTitle("PUT"), metrics.ops[http.MethodPut].total, opTitle("HEAD"), metrics.ops[http.MethodHead].total, opTitle("GET"), metrics.ops[http.MethodGet].total, opTitle("LIST"), metrics.ops["LIST"].total))
+	addLine(title("Total Failures:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numFailed, opTitle("PUT"), metrics.ops[http.MethodPut].failures, opTitle("HEAD"), metrics.ops[http.MethodHead].failures, opTitle("GET"), metrics.ops[http.MethodGet].failures, opTitle("LIST"), metrics.ops["LIST"].failures))
 
-	if len(m.Failures) > 0 {
-		addRow("------------------------------------------- Errors --------------------------------------------------")
-		for _, s := range m.Failures {
-			addRow(console.Colorize("metrics-error", s))
+	for _, s := range metrics.Failures {
+		addRow(console.Colorize("metrics-error", s))
+	}
+	if len(metrics.Failures) > 0 {
+		addLine("", "------------------------------------------- Errors --------------------------------------------------")
+		for _, s := range metrics.Failures {
+			addLine("", console.Colorize("metrics-error", s))
 		}
 	}
+	table.AppendBulk(data)
 	table.Render()
+
 	return s.String()
 }

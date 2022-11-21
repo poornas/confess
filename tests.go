@@ -51,10 +51,11 @@ func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (e
 			for res := range resCh {
 				r := res.(PutOpResult)
 				outFn(testResult{
-					Method: string(r.op),
-					Path:   fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
-					Node:   n.nodes[r.nodeIdx].endpointURL.Host,
-					Err:    r.err,
+					Method:  string(r.op),
+					Path:    fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
+					Node:    n.nodes[r.nodeIdx].endpointURL.Host,
+					Err:     r.err,
+					Latency: r.latency,
 				})
 				n.buf.objects = append(n.buf.objects, Object{Key: r.data.Key, VersionID: r.data.VersionID})
 				atomic.AddUint32(&n.bIdx, 1)
@@ -65,19 +66,21 @@ func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (e
 				for gr := range getCh {
 					res := gr.(GetOpResult)
 					outFn(testResult{
-						Method: string(r.op),
-						Path:   fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
-						Node:   n.nodes[r.nodeIdx].endpointURL.Host,
-						Err:    r.err,
+						Method:  string(r.op),
+						Path:    fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
+						Node:    n.nodes[r.nodeIdx].endpointURL.Host,
+						Err:     r.err,
+						Latency: r.latency,
 					})
 					statCh := n.runConcurrent(ctx2, statOp(true, ObjVerifier{ObjectInfo: res.data}))
 					for sres := range statCh {
 						r := sres.(StatOpResult)
 						outFn(testResult{
-							Method: string(r.op),
-							Path:   fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
-							Node:   n.nodes[r.nodeIdx].endpointURL.Host,
-							Err:    r.err,
+							Method:  string(r.op),
+							Path:    fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
+							Node:    n.nodes[r.nodeIdx].endpointURL.Host,
+							Err:     r.err,
+							Latency: r.latency,
 						})
 					}
 				}
@@ -194,6 +197,7 @@ type opResult struct {
 	nodeIdx int
 	bucket  string
 	data    minio.ObjectInfo
+	latency time.Duration
 }
 type PutOpResult struct {
 	opResult
@@ -208,6 +212,7 @@ type GetOpResult struct {
 type StatOpResult GetOpResult
 
 func (n *nodeState) put(ctx context.Context, o putOpts) (res PutOpResult) {
+	start := time.Now()
 	reader := getDataReader(o.Size)
 	defer reader.Close()
 	node := n.nodes[o.NodeIdx]
@@ -223,12 +228,15 @@ func (n *nodeState) put(ctx context.Context, o putOpts) (res PutOpResult) {
 			nodeIdx: o.NodeIdx,
 			bucket:  o.Bucket,
 			data:    toObjectInfo(oi),
+			latency: time.Now().Sub(start),
 		},
 		opts: o,
 	}
 }
 
 func (n *nodeState) get(ctx context.Context, o getOpts) (res GetOpResult) {
+	start := time.Now()
+
 	node := n.nodes[o.NodeIdx]
 	if n.hc.isOffline(node.endpointURL) {
 		res.offline = true
@@ -251,12 +259,15 @@ func (n *nodeState) get(ctx context.Context, o getOpts) (res GetOpResult) {
 			err:     err,
 			nodeIdx: o.NodeIdx,
 			data:    oi,
+			latency: time.Now().Sub(start),
 		},
 		opts: o,
 	}
 }
 
 func (n *nodeState) stat(ctx context.Context, o statOpts) (res StatOpResult) {
+	start := time.Now()
+
 	node := n.nodes[o.NodeIdx]
 	if n.hc.isOffline(node.endpointURL) {
 		res.offline = true
@@ -275,10 +286,11 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res StatOpResult) {
 
 	return StatOpResult{
 		opResult: opResult{
-			op:      http.MethodGet,
+			op:      http.MethodHead,
 			err:     err,
 			nodeIdx: o.NodeIdx,
 			data:    oi,
+			latency: time.Now().Sub(start),
 		},
 		opts: getOpts(o),
 	}
