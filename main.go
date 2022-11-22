@@ -59,11 +59,10 @@ type node struct {
 }
 
 type nodeState struct {
-	nodes        []*node
-	hc           *healthChecker
-	cliCtx       *cli.Context
-	buf          *objectsBuf
-	inconsistent bool
+	nodes  []*node
+	hc     *healthChecker
+	cliCtx *cli.Context
+	buf    *objectsBuf
 }
 
 type Object struct {
@@ -120,7 +119,7 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "bucket",
-			Usage: "Bucket to use for confess tests. ALL DATA WILL BE DELETED IN BUCKET!",
+			Usage: "Bucket to use for confess tests",
 		},
 		cli.DurationFlag{
 			Name:  "duration",
@@ -347,7 +346,7 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Note that you can also use progress.Model.SetPercent to set the
 		// percentage value explicitly, too.
 		sinceStart := time.Since(m.metrics.startTime)
-		cmd := m.progress.IncrPercent(sinceStart.Seconds() / m.duration.Seconds())
+		cmd := m.progress.SetPercent(sinceStart.Seconds() / m.duration.Seconds())
 		return m, tea.Batch(tickCmd(), cmd)
 
 	// FrameMsg is sent when the progress bar wants to animate itself
