@@ -245,7 +245,6 @@ const (
 	maxWidth = 80
 )
 
-var helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Render
 var titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#008080")).Render
 
 func initUI(duration time.Duration) *resultsModel {
@@ -295,29 +294,6 @@ func monkeyconMain(ctx *cli.Context) {
 		globalCancel()
 		console.Fatalln("Unable to start monkeycon")
 	}
-	// this is just to test the healthcheck ping
-	//todo: remove this code:begin
-	/*
-		hcTimer := time.NewTimer(15 * time.Second)
-		defer hcTimer.Stop()
-		for {
-			select {
-			case <-hcTimer.C:
-				for _, n := range nodeState.nodes {
-					st := "online"
-					if nodeState.hc.isOffline(n.endpointURL) {
-						st = "offline"
-					}
-					fmt.Println(n.endpointURL, " is :", st)
-				}
-				hcTimer.Reset(15 * time.Second)
-			case <-globalContext.Done():
-				return
-			}
-		}
-	*/
-	//todo: remove this code:end
-
 }
 
 func (m *resultsModel) Init() tea.Cmd {
@@ -358,7 +334,8 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Note that you can also use progress.Model.SetPercent to set the
 		// percentage value explicitly, too.
-		cmd := m.progress.IncrPercent(float64(time.Since(m.metrics.startTime) / m.duration))
+		sinceStart := time.Since(m.metrics.startTime)
+		cmd := m.progress.IncrPercent(sinceStart.Seconds() / m.duration.Seconds())
 		return m, tea.Batch(tickCmd(), cmd)
 
 	// FrameMsg is sent when the progress bar wants to animate itself
@@ -390,7 +367,7 @@ func opTitle(s string) string {
 func (m *resultsModel) View() string {
 	var s strings.Builder
 	if !m.quitting {
-		s.WriteString(fmt.Sprintf("%s %s\n", console.Colorize("title", "Monkeycon activity:"), m.spinner.View()))
+		s.WriteString(fmt.Sprintf("%s %s at %s\n", console.Colorize("title", "Monkeycon last operation:"), m.metrics.lastOp, m.metrics.ops[m.metrics.lastOp].lastNode))
 		pad := strings.Repeat(" ", padding)
 		s.WriteString("\n" +
 			pad + m.progress.View() + "\n\n")
@@ -402,10 +379,6 @@ func (m *resultsModel) View() string {
 	table.SetAlignment(tablewriter.ALIGN_LEFT)
 	table.SetBorder(true)
 	table.SetRowLine(false)
-	addRow := func(s string) {
-		table.Append([]string{s})
-	}
-
 	var data [][]string
 
 	addLine := func(prefix string, value interface{}) {
@@ -426,12 +399,13 @@ func (m *resultsModel) View() string {
 	addLine(title("Total Operations:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numTests, opTitle("PUT"), metrics.ops[http.MethodPut].total, opTitle("HEAD"), metrics.ops[http.MethodHead].total, opTitle("GET"), metrics.ops[http.MethodGet].total, opTitle("LIST"), metrics.ops["LIST"].total))
 	addLine(title("Total Failures:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numFailed, opTitle("PUT"), metrics.ops[http.MethodPut].failures, opTitle("HEAD"), metrics.ops[http.MethodHead].failures, opTitle("GET"), metrics.ops[http.MethodGet].failures, opTitle("LIST"), metrics.ops["LIST"].failures))
 
-	for _, s := range metrics.Failures {
-		addRow(console.Colorize("metrics-error", s))
-	}
 	if len(metrics.Failures) > 0 {
+		lim := 10
+		if len(metrics.Failures) < lim {
+			lim = len(metrics.Failures)
+		}
 		addLine("", "------------------------------------------- Errors --------------------------------------------------")
-		for _, s := range metrics.Failures {
+		for _, s := range metrics.Failures[:lim] {
 			addLine("", console.Colorize("metrics-error", s))
 		}
 	}
