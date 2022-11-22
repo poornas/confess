@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -48,7 +49,7 @@ var (
 )
 
 const (
-	envPrefix = "MONKEYCON_"
+	envPrefix = "CONFESS_"
 )
 
 // node represents an endpoint to S3 object store
@@ -58,24 +59,26 @@ type node struct {
 }
 
 type nodeState struct {
-	nodes  []*node
-	hc     *healthChecker
-	cliCtx *cli.Context
-	buf    *objectsBuf
-	bIdx   uint32
+	nodes        []*node
+	hc           *healthChecker
+	cliCtx       *cli.Context
+	buf          *objectsBuf
+	inconsistent bool
 }
 
 type Object struct {
 	Key       string
 	VersionID string
+	ETag      string
 }
 type objectsBuf struct {
+	lock    sync.RWMutex
 	objects []Object
 }
 
 func newObjectsBuf() *objectsBuf {
 	return &objectsBuf{
-		objects: make([]Object, bufSize),
+		objects: make([]Object, 0, bufSize),
 	}
 }
 func main() {
@@ -117,7 +120,7 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "bucket",
-			Usage: "Bucket to use for monkeycon tests. ALL DATA WILL BE DELETED IN BUCKET!",
+			Usage: "Bucket to use for confess tests. ALL DATA WILL BE DELETED IN BUCKET!",
 		},
 		cli.DurationFlag{
 			Name:  "duration",
@@ -135,10 +138,10 @@ FLAGS:
 SITE:
   SITE is a comma separated list of pools of that site: http://172.17.0.{2...5},http://172.17.0.{6...9} or one or more nodes.
 EXAMPLES:
-  1. Run monkeycon consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000)
-     $ monkeycon http://minio{1...4}:9000
+  1. Run confess consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000)
+     $ confess http://minio{1...4}:9000
 `
-	app.Action = monkeyconMain
+	app.Action = confessMain
 	app.Run(os.Args)
 }
 
@@ -165,7 +168,7 @@ func (m resultMsg) JSON() string {
 	// Disable escaping special chars to display XML tags correctly
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(m); err != nil {
-		console.Fatalln(fmt.Errorf("Unable to marshal into JSON %w", err))
+		console.Fatalln(fmt.Errorf("unable to marshal into JSON %w", err))
 	}
 	return buf.String()
 }
@@ -178,6 +181,7 @@ type testResult struct {
 	Err      error         `json:"err,omitempty"`
 	Latency  time.Duration `json:"duration"`
 	Final    bool          `json:"final"`
+	Cleanup  bool          `json:"cleanup"`
 }
 type resultsModel struct {
 	spinner  spinner.Model
@@ -185,6 +189,7 @@ type resultsModel struct {
 	metrics  *metrics
 	duration time.Duration
 	quitting bool
+	cleanup  bool
 }
 
 type opStats struct {
@@ -255,11 +260,13 @@ func initUI(duration time.Duration) *resultsModel {
 	console.SetColor("path", color.New(color.FgGreen))
 	console.SetColor("error", color.New(color.FgHiRed))
 	console.SetColor("title", color.New(color.FgHiCyan))
+	console.SetColor("cleanup", color.New(color.FgHiMagenta))
+
 	console.SetColor("node", color.New(color.FgCyan))
 
 	return &resultsModel{
 		spinner:  s,
-		progress: progress.New(progress.WithDefaultGradient()),
+		progress: progress.New(progress.WithGradient("#008080", "#adff2f")),
 		duration: duration,
 		metrics: &metrics{
 			ops:       make(map[string]opStats),
@@ -274,8 +281,10 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-func monkeyconMain(ctx *cli.Context) {
+func confessMain(ctx *cli.Context) {
 	checkMain(ctx)
+	rand.Seed(time.Now().UnixNano())
+
 	nodeState := configureClients(ctx)
 	ui := tea.NewProgram(initUI(ctx.Duration("duration")))
 	go func() {
@@ -287,12 +296,12 @@ func monkeyconMain(ctx *cli.Context) {
 			ui.Send(res)
 		})
 		if e != nil && !errors.Is(e, context.Canceled) {
-			console.Fatalln(fmt.Errorf("unable to run monkeycon: %w", e))
+			console.Fatalln(fmt.Errorf("unable to run confess: %w", e))
 		}
 	}()
 	if e := ui.Start(); e != nil {
 		globalCancel()
-		console.Fatalln("Unable to start monkeycon")
+		console.Fatalln("Unable to start confess")
 	}
 }
 
@@ -315,6 +324,9 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case testResult:
 		m.metrics.Update(msg)
+		if msg.Cleanup {
+			m.cleanup = true
+		}
 		if msg.Final {
 			m.quitting = true
 			return m, tea.Quit
@@ -329,7 +341,7 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		if m.progress.Percent() == 1.0 {
-			return m, tea.Quit
+			return m, nil
 		}
 
 		// Note that you can also use progress.Model.SetPercent to set the
@@ -367,7 +379,10 @@ func opTitle(s string) string {
 func (m *resultsModel) View() string {
 	var s strings.Builder
 	if !m.quitting {
-		s.WriteString(fmt.Sprintf("%s %s at %s\n", console.Colorize("title", "Monkeycon last operation:"), m.metrics.lastOp, m.metrics.ops[m.metrics.lastOp].lastNode))
+		if m.cleanup {
+			s.WriteString(fmt.Sprintf("%s %s\n", console.Colorize("title", "confess last operation:"), console.Colorize("cleanup", "cleaning up bucket..")))
+		}
+		s.WriteString(fmt.Sprintf("%s %s at %s\n", console.Colorize("title", "confess last operation:"), m.metrics.lastOp, m.metrics.ops[m.metrics.lastOp].lastNode))
 		pad := strings.Repeat(" ", padding)
 		s.WriteString("\n" +
 			pad + m.progress.View() + "\n\n")
@@ -396,8 +411,8 @@ func (m *resultsModel) View() string {
 		s.WriteString("(waiting for data)")
 		return s.String()
 	}
-	addLine(title("Total Operations:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numTests, opTitle("PUT"), metrics.ops[http.MethodPut].total, opTitle("HEAD"), metrics.ops[http.MethodHead].total, opTitle("GET"), metrics.ops[http.MethodGet].total, opTitle("LIST"), metrics.ops["LIST"].total))
-	addLine(title("Total Failures:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numFailed, opTitle("PUT"), metrics.ops[http.MethodPut].failures, opTitle("HEAD"), metrics.ops[http.MethodHead].failures, opTitle("GET"), metrics.ops[http.MethodGet].failures, opTitle("LIST"), metrics.ops["LIST"].failures))
+	addLine(title("Total Operations:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numTests, opTitle("PUT"), metrics.ops[http.MethodPut].total, opTitle("HEAD"), metrics.ops[http.MethodHead].total, opTitle("GET"), metrics.ops[http.MethodGet].total, opTitle("LIST"), metrics.ops["LIST"].total, opTitle("DEL"), metrics.ops[http.MethodDelete].total))
+	addLine(title("Total Failures:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numFailed, opTitle("PUT"), metrics.ops[http.MethodPut].failures, opTitle("HEAD"), metrics.ops[http.MethodHead].failures, opTitle("GET"), metrics.ops[http.MethodGet].failures, opTitle("LIST"), metrics.ops["LIST"].failures, opTitle("DEL"), metrics.ops[http.MethodDelete].failures))
 
 	if len(metrics.Failures) > 0 {
 		lim := 10

@@ -26,9 +26,6 @@ import (
 
 var slashSeparator = "/"
 
-// tlsClientSessionCacheSize is the cache size for TLS client sessions.
-const tlsClientSessionCacheSize = 100
-
 // clientTransport returns a new http configuration
 // used while communicating with the host.
 func clientTransport(ctx *cli.Context, enableTLS bool) *http.Transport {
@@ -94,7 +91,7 @@ func getClient(ctx *cli.Context, hostURL *url.URL) (*minio.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	cl.SetAppInfo("monkeycon", pkg.Version)
+	cl.SetAppInfo("confess", pkg.Version)
 	return cl, nil
 }
 

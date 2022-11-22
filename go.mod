@@ -1,4 +1,4 @@
-module github.com/minio/monkeycon
+module github.com/minio/confess
 
 go 1.18
 
