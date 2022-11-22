@@ -7,7 +7,6 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/lithammer/shortuuid/v4"
@@ -41,46 +40,55 @@ func deleteOp(concurrency bool, key, versionID string) Op {
 		VersionID:  versionID,
 	}
 }
+func listOp(pfx string) Op {
+	return Op{
+		Type:   "LIST",
+		Prefix: pfx,
+	}
+}
 
 // create upto bufSize worth of objects. Once past bufSize, delete previously uploaded and
 // replace with a new upload
 func (n *nodeState) prepareTest(ctx context.Context, nodeIdx int, outFn func(res testResult)) {
 	res := n.runTest(ctx, nodeIdx, putOp(true))
-	r := res.(PutOpResult)
-	outFn(testResult{
-		Method:  string(r.op),
-		Path:    fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
-		Node:    n.nodes[nodeIdx].endpointURL.Host,
-		Err:     r.err,
-		Latency: r.latency,
-	})
-	n.buf.lock.Lock()
-	if len(n.buf.objects) < bufSize {
-		n.buf.objects = append(n.buf.objects, Object{Key: r.data.Key, VersionID: r.data.VersionID})
-	} else {
-		idx := rand.Intn(len(n.buf.objects))
-		o := n.buf.objects[idx]
-		go n.deleteTest(ctx, nodeIdx, o.Key, o.VersionID, outFn)
-		n.buf.objects[idx] = Object{Key: r.data.Key, VersionID: r.data.VersionID}
+	if r, ok := res.(PutOpResult); ok {
+
+		outFn(testResult{
+			Method:  string(r.op),
+			Path:    fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
+			Node:    n.nodes[nodeIdx].endpointURL.Host,
+			Err:     r.err,
+			Latency: r.latency,
+		})
+		n.buf.lock.Lock()
+		if len(n.buf.objects) < bufSize {
+			n.buf.objects = append(n.buf.objects, Object{Key: r.data.Key, VersionID: r.data.VersionID})
+		} else {
+			idx := rand.Intn(len(n.buf.objects))
+			o := n.buf.objects[idx]
+			go n.deleteTest(ctx, nodeIdx, o.Key, o.VersionID, outFn)
+			n.buf.objects[idx] = Object{Key: r.data.Key, VersionID: r.data.VersionID}
+		}
+		n.buf.lock.Unlock()
 	}
-	n.buf.lock.Unlock()
 }
 
-// deleteTest deletes a key
+// deleteTest deletes an object
 func (n *nodeState) deleteTest(ctx context.Context, nodeIdx int, key, versionID string, outFn func(res testResult)) {
 	node := n.nodes[nodeIdx]
 	if n.hc.isOffline(node.endpointURL) {
 		return
 	}
 	dres := n.runTest(ctx, nodeIdx, deleteOp(false, key, versionID))
-	r := dres.(DelOpResult)
-	outFn(testResult{
-		Method:  string(r.op),
-		Path:    fmt.Sprintf("%s/%s", r.bucket, key),
-		Node:    n.nodes[r.nodeIdx].endpointURL.Host,
-		Err:     r.err,
-		Latency: r.latency,
-	})
+	if r, ok := dres.(DelOpResult); ok {
+		outFn(testResult{
+			Method:  string(r.op),
+			Path:    fmt.Sprintf("%s/%s", r.bucket, key),
+			Node:    n.nodes[r.nodeIdx].endpointURL.Host,
+			Err:     r.err,
+			Latency: r.latency,
+		})
+	}
 }
 func (n *nodeState) finishTest(ctx context.Context, outFn func(res testResult)) {
 	bucket := n.cliCtx.String("bucket")
@@ -102,38 +110,22 @@ func (n *nodeState) finishTest(ctx context.Context, outFn func(res testResult)) 
 		})
 		return
 	}
-	doneCh := make(chan struct{})
-	defer close(doneCh)
+
 	start := time.Now()
-	for objCh := range clnt.ListObjects(ctx, bucket, minio.ListObjectsOptions{Recursive: true}) {
-		if objCh.Err != nil {
+	for _, pfx := range n.buf.prefixes {
+		err := clnt.RemoveObject(ctx, bucket, pfx, minio.RemoveObjectOptions{ForceDelete: true})
+		if err != nil {
 			outFn(testResult{
-				Method:  "LIST",
-				Path:    fmt.Sprintf("%s/%s", bucket, objCh.Key),
+				Method:  http.MethodDelete,
+				Path:    fmt.Sprintf("%s/%s", bucket, pfx),
 				Node:    n.nodes[nodeIdx].endpointURL.Host,
-				Err:     objCh.Err,
+				Err:     err,
 				Latency: time.Since(start),
 				Cleanup: true,
 			})
-			return
-		}
-		if objCh.Key != "" {
-			start = time.Now()
-			err := clnt.RemoveObject(ctx, bucket, objCh.Key, minio.RemoveObjectOptions{})
-			if err != nil {
-				outFn(testResult{
-					Method:  http.MethodDelete,
-					Path:    fmt.Sprintf("%s/%s", bucket, objCh.Key),
-					Node:    n.nodes[nodeIdx].endpointURL.Host,
-					Err:     objCh.Err,
-					Latency: time.Since(start),
-					Cleanup: true,
-				})
-				continue
-			}
+			continue
 		}
 	}
-
 	// // objects are already deleted, clear the buckets now
 	// start = time.Now()
 	// err := clnt.RemoveBucket(ctx, bucket)
@@ -161,6 +153,10 @@ func (n *nodeState) getRandomObj() Object {
 func (n *nodeState) getRandomNode() int {
 	return rand.Intn(len(n.nodes))
 }
+func (n *nodeState) getRandomPfx() string {
+	idx := rand.Intn(len(n.buf.prefixes))
+	return n.buf.prefixes[idx]
+}
 func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (err error) {
 	// defer func() {
 	// 	n.finishTest(globalContext, outFn)
@@ -168,6 +164,7 @@ func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (e
 	// 		Final: true,
 	// 	})
 	// }()
+	bucket := n.cliCtx.String("bucket")
 
 	var ctx2 = ctx
 	if n.cliCtx.IsSet("duration") {
@@ -184,6 +181,16 @@ func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (e
 
 			// upload bufSize objects
 			n.prepareTest(ctx2, nodeIdx, outFn)
+			lr := n.runTest(ctx2, nodeIdx, listOp(n.getRandomPfx()))
+			if res, ok := lr.(ListOpResult); ok {
+				outFn(testResult{
+					Method:  string(res.op),
+					Path:    fmt.Sprintf("%s/%s", bucket, res.opts.Prefix),
+					Node:    n.nodes[res.nodeIdx].endpointURL.Host,
+					Err:     res.err,
+					Latency: res.latency,
+				})
+			}
 			o := n.getRandomObj() // get random object from buffer
 			gr := n.runTest(ctx2, nodeIdx, getOp(true, ObjVerifier{ObjectInfo: minio.ObjectInfo{
 				ETag: o.ETag,
@@ -193,7 +200,7 @@ func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (e
 			if ok {
 				outFn(testResult{
 					Method:  string(res.op),
-					Path:    fmt.Sprintf("%s/%s", res.bucket, res.data.Key),
+					Path:    fmt.Sprintf("%s/%s", bucket, o.Key),
 					Node:    n.nodes[res.nodeIdx].endpointURL.Host,
 					Err:     res.err,
 					Latency: res.latency,
@@ -202,7 +209,7 @@ func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (e
 				if r, ok := sres.(StatOpResult); ok {
 					outFn(testResult{
 						Method:  string(r.op),
-						Path:    fmt.Sprintf("%s/%s", r.bucket, r.data.Key),
+						Path:    fmt.Sprintf("%s/%s", bucket, o.Key),
 						Node:    n.nodes[r.nodeIdx].endpointURL.Host,
 						Err:     r.err,
 						Latency: r.latency,
@@ -223,6 +230,7 @@ type Op struct {
 	Concurrent bool // run op on all nodes concurrently
 	Key        string
 	VersionID  string
+	Prefix     string
 	NodeIdx    int // node at which to run operation
 }
 type ObjVerifier struct {
@@ -233,73 +241,82 @@ type OpSeq struct {
 	Ops []Op
 }
 
-func (n *nodeState) runTest(ctx context.Context, nodeIdx int, op Op) (res OpResult) {
-	var wg sync.WaitGroup
+func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res OpResult) {
 	bucket := n.cliCtx.String("bucket")
-	node := n.nodes[nodeIdx]
+	node := n.nodes[idx]
 	if n.hc.isOffline(node.endpointURL) {
 		return
 	}
-	wg.Add(1)
-	go func(idx int) {
-		defer wg.Done()
-		switch op.Type {
-		case http.MethodPut:
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				res = n.put(ctx, putOpts{
-					Bucket:  bucket,
-					Object:  fmt.Sprintf("%s/%d", shortuuid.New(), idx),
-					NodeIdx: idx,
-				})
-				return
-			}
-		case http.MethodGet:
-			select {
-			default:
-				res = n.get(ctx, getOpts{
-					Bucket:   bucket,
-					Object:   op.Verifier.Key,
-					NodeIdx:  idx,
-					Verifier: op.Verifier.ObjectInfo,
-				})
-				return
-			case <-ctx.Done():
-				return
-			}
-		case http.MethodHead:
-			select {
-			default:
-				res = n.stat(ctx, statOpts{
-					Bucket:   bucket,
-					Object:   op.Verifier.Key,
-					NodeIdx:  idx,
-					Verifier: op.Verifier.ObjectInfo,
-				})
-				return
-			case <-ctx.Done():
-				return
-			}
-		case http.MethodDelete:
-			select {
-			default:
-				res = n.delete(ctx, delOpts{
-					Bucket:              bucket,
-					Object:              op.Key,
-					RemoveObjectOptions: minio.RemoveObjectOptions{VersionID: op.VersionID},
-					NodeIdx:             idx,
-				})
-				return
-			case <-ctx.Done():
-				return
-			}
-		default:
-		}
-	}(nodeIdx)
 
-	wg.Wait()
+	switch op.Type {
+	case http.MethodPut:
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			pfx := n.buf.prefixes[rand.Intn(len(n.buf.prefixes))]
+			res = n.put(ctx, putOpts{
+				Bucket:  bucket,
+				Object:  fmt.Sprintf("%s/%s", pfx, shortuuid.New()),
+				NodeIdx: idx,
+			})
+			return
+		}
+	case http.MethodGet:
+		select {
+		default:
+			res = n.get(ctx, getOpts{
+				Bucket:   bucket,
+				Object:   op.Verifier.Key,
+				NodeIdx:  idx,
+				Verifier: op.Verifier.ObjectInfo,
+			})
+			return
+		case <-ctx.Done():
+			return
+		}
+	case http.MethodHead:
+		select {
+		default:
+			res = n.stat(ctx, statOpts{
+				Bucket:   bucket,
+				Object:   op.Verifier.Key,
+				NodeIdx:  idx,
+				Verifier: op.Verifier.ObjectInfo,
+			})
+			return
+		case <-ctx.Done():
+			return
+		}
+	case http.MethodDelete:
+		select {
+		default:
+			res = n.delete(ctx, delOpts{
+				Bucket:              bucket,
+				Object:              op.Key,
+				RemoveObjectOptions: minio.RemoveObjectOptions{VersionID: op.VersionID},
+				NodeIdx:             idx,
+			})
+			return
+		case <-ctx.Done():
+			return
+		}
+	case "LIST":
+		select {
+		default:
+			pfx := n.buf.prefixes[rand.Intn(len(n.buf.prefixes))]
+			res = n.list(ctx, listOpts{
+				Bucket:  bucket,
+				Prefix:  pfx,
+				NodeIdx: idx,
+			})
+			return
+		case <-ctx.Done():
+			return
+		}
+	default:
+	}
+
 	return res
 }
 
@@ -330,8 +347,9 @@ type delOpts struct {
 	NodeIdx int
 }
 type listOpts struct {
+	minio.ListObjectsOptions
 	Bucket  string
-	Object  string
+	Prefix  string
 	NodeIdx int
 }
 
@@ -360,6 +378,11 @@ type StatOpResult GetOpResult
 type DelOpResult struct {
 	opResult
 	opts delOpts
+}
+
+type ListOpResult struct {
+	opResult
+	opts listOpts
 }
 
 func (n *nodeState) put(ctx context.Context, o putOpts) (res PutOpResult) {
@@ -468,6 +491,45 @@ func (n *nodeState) delete(ctx context.Context, o delOpts) (res DelOpResult) {
 		opts: delOpts(o),
 	}
 }
+func (n *nodeState) list(ctx context.Context, o listOpts) (res ListOpResult) {
+
+	start := time.Now()
+
+	node := n.nodes[o.NodeIdx]
+	if n.hc.isOffline(node.endpointURL) {
+		res.offline = true
+		return
+	}
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+	for objCh := range node.client.ListObjects(ctx, o.Bucket, minio.ListObjectsOptions{
+		Prefix:       o.Prefix,
+		Recursive:    true,
+		WithVersions: true,
+	}) {
+		if objCh.Err != nil {
+			return ListOpResult{
+				opResult: opResult{
+					op:      "LIST",
+					err:     objCh.Err,
+					nodeIdx: o.NodeIdx,
+					latency: time.Since(start),
+				},
+				opts: listOpts(o),
+			}
+		}
+	}
+	return ListOpResult{
+		opResult: opResult{
+			op:      "LIST",
+			err:     nil,
+			nodeIdx: o.NodeIdx,
+			latency: time.Since(start),
+		},
+		opts: listOpts(o),
+	}
+}
+
 func toObjectInfo(o minio.UploadInfo) minio.ObjectInfo {
 	return minio.ObjectInfo{
 		Key:            o.Key,

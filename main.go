@@ -71,13 +71,19 @@ type Object struct {
 	ETag      string
 }
 type objectsBuf struct {
-	lock    sync.RWMutex
-	objects []Object
+	lock     sync.RWMutex
+	objects  []Object
+	prefixes []string
 }
 
 func newObjectsBuf() *objectsBuf {
+	var pfxes []string
+	for i := 0; i < 10; i++ {
+		pfxes = append(pfxes, fmt.Sprintf("prefix%d", i))
+	}
 	return &objectsBuf{
-		objects: make([]Object, 0, bufSize),
+		objects:  make([]Object, 0, bufSize),
+		prefixes: pfxes,
 	}
 }
 func main() {
@@ -418,9 +424,9 @@ func (m *resultsModel) View() string {
 		if len(metrics.Failures) < lim {
 			lim = len(metrics.Failures)
 		}
-		addLine("", "------------------------------------------- Errors --------------------------------------------------")
+		addLine("", "-----------------------------------------Errors------------------------------------------------------")
 		for _, s := range metrics.Failures[:lim] {
-			addLine("", console.Colorize("metrics-error", s))
+			addLine(s.Node, console.Colorize("metrics-error", fmt.Sprintf("%s %s %d :%s", s.Method, s.Path, s.Latency, s.Err.Error())))
 		}
 	}
 	table.AppendBulk(data)
