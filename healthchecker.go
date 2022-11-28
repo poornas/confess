@@ -13,9 +13,7 @@ import (
 )
 
 const (
-	defaultHealthCheckDuration = 5 * time.Second
-	// default interval for reload of all remote target endpoints
-	defaultHealthCheckReloadDuration = 30 * time.Minute
+	defaultHealthCheckDuration = 1 * time.Second
 )
 
 type healthChecker struct {
