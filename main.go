@@ -115,7 +115,7 @@ func main() {
 		cli.StringFlag{
 			Name:   "region",
 			Usage:  "Specify a custom region",
-			EnvVar: envPrefix + "_REGION",
+			EnvVar: envPrefix + "REGION",
 		},
 		cli.StringFlag{
 			Name:   "signature",
