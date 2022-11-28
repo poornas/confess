@@ -82,7 +82,7 @@ func getClient(ctx *cli.Context, hostURL *url.URL) (*minio.Client, error) {
 	}
 	cl, err := minio.New(hostURL.Host, &minio.Options{
 		Creds:        creds,
-		Secure:       ctx.Bool("tls"),
+		Secure:       hostURL.Scheme == "https",
 		Region:       ctx.String("region"),
 		BucketLookup: minio.BucketLookupAuto,
 		CustomMD5:    md5simd.NewServer().NewHash,
