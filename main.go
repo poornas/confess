@@ -125,11 +125,6 @@ func main() {
 			Name:  "bucket",
 			Usage: "Bucket to use for confess tests",
 		},
-		cli.DurationFlag{
-			Name:  "duration",
-			Usage: "Duration to run the tests. Use 's' and 'm' to specify seconds and minutes.",
-			Value: 30 * time.Second,
-		},
 	}
 	app.CustomAppHelpTemplate = `NAME:
   {{.Name}} - {{.Description}}
@@ -189,7 +184,6 @@ type testResult struct {
 type resultsModel struct {
 	spinner  spinner.Model
 	metrics  *metrics
-	duration time.Duration
 	quitting bool
 	cleanup  bool
 }
@@ -254,7 +248,7 @@ const (
 
 var titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#008080")).Render
 
-func initUI(duration time.Duration) *resultsModel {
+func initUI() *resultsModel {
 	s := spinner.New()
 	s.Spinner = spinner.Points
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
@@ -267,8 +261,7 @@ func initUI(duration time.Duration) *resultsModel {
 	console.SetColor("node", color.New(color.FgCyan))
 
 	return &resultsModel{
-		spinner:  s,
-		duration: duration,
+		spinner: s,
 		metrics: &metrics{
 			ops:       make(map[string]opStats),
 			Failures:  make([]testResult, 0),
@@ -282,7 +275,7 @@ func confessMain(ctx *cli.Context) {
 	rand.Seed(time.Now().UnixNano())
 
 	nodeState := configureClients(ctx)
-	ui := tea.NewProgram(initUI(ctx.Duration("duration")))
+	ui := tea.NewProgram(initUI())
 	go func() {
 		e := nodeState.runTests(globalContext, func(res testResult) {
 			if globalJSON {

@@ -165,23 +165,16 @@ func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (e
 	// 	})
 	// }()
 	bucket := n.cliCtx.String("bucket")
-
-	var ctx2 = ctx
-	if n.cliCtx.IsSet("duration") {
-		var cancel context.CancelFunc
-		ctx2, cancel = context.WithDeadline(context.Background(), time.Now().Add(n.cliCtx.Duration("duration")))
-		defer cancel()
-	}
 	for {
 		select {
-		case <-ctx2.Done():
+		case <-ctx.Done():
 			return
 		default:
 			nodeIdx := n.getRandomNode()
 
 			// upload bufSize objects
-			n.prepareTest(ctx2, nodeIdx, outFn)
-			lr := n.runTest(ctx2, nodeIdx, listOp(n.getRandomPfx()))
+			n.prepareTest(ctx, nodeIdx, outFn)
+			lr := n.runTest(ctx, nodeIdx, listOp(n.getRandomPfx()))
 			if res, ok := lr.(ListOpResult); ok {
 				outFn(testResult{
 					Method:  string(res.op),
@@ -192,7 +185,7 @@ func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (e
 				})
 			}
 			o := n.getRandomObj() // get random object from buffer
-			gr := n.runTest(ctx2, nodeIdx, getOp(true, ObjVerifier{ObjectInfo: minio.ObjectInfo{
+			gr := n.runTest(ctx, nodeIdx, getOp(true, ObjVerifier{ObjectInfo: minio.ObjectInfo{
 				ETag: o.ETag,
 				Key:  o.Key,
 			}}))
@@ -205,7 +198,7 @@ func (n *nodeState) runTests(ctx context.Context, outFn func(res testResult)) (e
 					Err:     res.err,
 					Latency: res.latency,
 				})
-				sres := n.runTest(ctx2, nodeIdx, statOp(true, ObjVerifier{ObjectInfo: res.data}))
+				sres := n.runTest(ctx, nodeIdx, statOp(true, ObjVerifier{ObjectInfo: res.data}))
 				if r, ok := sres.(StatOpResult); ok {
 					outFn(testResult{
 						Method:  string(r.op),
