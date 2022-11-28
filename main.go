@@ -29,7 +29,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -108,9 +107,8 @@ func main() {
 			Value:  "",
 		},
 		cli.BoolFlag{
-			Name:   "tls",
-			Usage:  "Use TLS (HTTPS) for transport",
-			EnvVar: envPrefix + "TLS",
+			Name:  "insecure",
+			Usage: "disable SSL certificate verification",
 		},
 		cli.StringFlag{
 			Name:   "region",
@@ -190,7 +188,6 @@ type testResult struct {
 }
 type resultsModel struct {
 	spinner  spinner.Model
-	progress progress.Model
 	metrics  *metrics
 	duration time.Duration
 	quitting bool
@@ -271,7 +268,6 @@ func initUI(duration time.Duration) *resultsModel {
 
 	return &resultsModel{
 		spinner:  s,
-		progress: progress.New(progress.WithGradient("#008080", "#adff2f")),
 		duration: duration,
 		metrics: &metrics{
 			ops:       make(map[string]opStats),
@@ -279,11 +275,6 @@ func initUI(duration time.Duration) *resultsModel {
 			startTime: time.Now(),
 		},
 	}
-}
-func tickCmd() tea.Cmd {
-	return tea.Tick(time.Second*1, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
 }
 
 func confessMain(ctx *cli.Context) {
@@ -311,7 +302,7 @@ func confessMain(ctx *cli.Context) {
 }
 
 func (m *resultsModel) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, tickCmd())
+	return m.spinner.Tick
 }
 
 func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -337,29 +328,6 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		return m, nil
-	case tea.WindowSizeMsg:
-		m.progress.Width = msg.Width - padding*2 - 4
-		if m.progress.Width > maxWidth {
-			m.progress.Width = maxWidth
-		}
-		return m, nil
-
-	case tickMsg:
-		if m.progress.Percent() == 1.0 {
-			return m, nil
-		}
-
-		// Note that you can also use progress.Model.SetPercent to set the
-		// percentage value explicitly, too.
-		sinceStart := time.Since(m.metrics.startTime)
-		cmd := m.progress.SetPercent(sinceStart.Seconds() / m.duration.Seconds())
-		return m, tea.Batch(tickCmd(), cmd)
-
-	// FrameMsg is sent when the progress bar wants to animate itself
-	case progress.FrameMsg:
-		progressModel, cmd := m.progress.Update(msg)
-		m.progress = progressModel.(progress.Model)
-		return m, cmd
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -388,9 +356,6 @@ func (m *resultsModel) View() string {
 			s.WriteString(fmt.Sprintf("%s %s\n", console.Colorize("title", "confess last operation:"), console.Colorize("cleanup", "cleaning up bucket..")))
 		}
 		s.WriteString(fmt.Sprintf("%s %s at %s\n", console.Colorize("title", "confess last operation:"), m.metrics.lastOp, m.metrics.ops[m.metrics.lastOp].lastNode))
-		pad := strings.Repeat(" ", padding)
-		s.WriteString("\n" +
-			pad + m.progress.View() + "\n\n")
 	}
 	// Set table header
 	table := tablewriter.NewWriter(&s)
