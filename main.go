@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -42,7 +43,7 @@ import (
 const bufSize = 100
 
 var (
-	version                     = "0.0.0-dev"
+	version                     = "1.0.0"
 	globalContext, globalCancel = context.WithCancel(context.Background())
 	globalJSON                  bool
 )
@@ -62,8 +63,11 @@ type nodeState struct {
 	hc     *healthChecker
 	cliCtx *cli.Context
 	buf    *objectsBuf
+	logCh  chan testResult
 }
 
+type ErrLog struct {
+}
 type Object struct {
 	Key       string
 	VersionID string
@@ -90,7 +94,7 @@ func main() {
 	app.Name = os.Args[0]
 	app.Author = "MinIO, Inc."
 	app.Description = `Object store consistency checker`
-	app.UsageText = "[SITE]"
+	app.UsageText = "HOSTS [FLAGS]"
 	app.Version = version
 	app.Copyright = "(c) 2022 MinIO, Inc."
 	app.Flags = []cli.Flag{
@@ -125,19 +129,23 @@ func main() {
 			Name:  "bucket",
 			Usage: "Bucket to use for confess tests",
 		},
+		cli.StringFlag{
+			Name:  "output, o",
+			Usage: "Specify output path for confess log",
+		},
 	}
 	app.CustomAppHelpTemplate = `NAME:
   {{.Name}} - {{.Description}}
 USAGE:
   {{.Name}} - {{.UsageText}}
+HOSTS:
+  HOSTS is a comma separated list or a range of hostnames/ip-addresses
 FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
-SITE:
-  SITE is a comma separated list of pools of that site: http://172.17.0.{2...5},http://172.17.0.{6...9} or one or more nodes.
 EXAMPLES:
-  1. Run confess consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000)
-     $ confess http://minio{1...4}:9000
+  1. Run consistency across 4 MinIO Servers (http://minio1:9000 to http://minio4:9000)
+     $ confess http://minio{1...4}:9000 --access-key minio --secret-key minio123
 `
 	app.Action = confessMain
 	app.Run(os.Args)
@@ -181,6 +189,11 @@ type testResult struct {
 	Final    bool          `json:"final"`
 	Cleanup  bool          `json:"cleanup"`
 }
+
+func (r *testResult) String() string {
+	return fmt.Sprintf("%s: %s %s %s %s", r.Node, r.Path, r.Method, r.FuncName, r.Err.Error())
+}
+
 type resultsModel struct {
 	spinner  spinner.Model
 	metrics  *metrics
@@ -239,12 +252,31 @@ func (m *metrics) Update(msg testResult) {
 	m.numTests++
 }
 
-type tickMsg time.Time
-
-const (
-	padding  = 0 // was 2
-	maxWidth = 80
-)
+func getHeader(ctx *cli.Context) string {
+	var s strings.Builder
+	s.WriteString("confess " + version + " ")
+	flags := ctx.GlobalFlagNames()
+	for idx, flag := range flags {
+		if !ctx.IsSet(flag) {
+			continue
+		}
+		switch {
+		case ctx.Bool(flag):
+			s.WriteString(fmt.Sprintf("%s=%t", flag, ctx.Bool(flag)))
+		case ctx.String(flag) != "":
+			val := ctx.String(flag)
+			if flag == "secret-key" {
+				val = "*REDACTED*"
+			}
+			s.WriteString(fmt.Sprintf("%s=%s", flag, val))
+		}
+		if idx != len(flags)-1 {
+			s.WriteString(" ")
+		}
+	}
+	s.WriteString("\n")
+	return s.String()
+}
 
 var titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#008080")).Render
 
@@ -283,9 +315,48 @@ func confessMain(ctx *cli.Context) {
 				return
 			}
 			ui.Send(res)
+			if res.Err != nil {
+				select {
+				case nodeState.logCh <- res:
+				case <-globalContext.Done():
+					return
+				}
+			}
 		})
 		if e != nil && !errors.Is(e, context.Canceled) {
 			console.Fatalln(fmt.Errorf("unable to run confess: %w", e))
+		}
+
+	}()
+	go func() {
+		logFile := fmt.Sprintf("%s%s", "confess_log", time.Now().Format(".01-02-2006-15-04-05"))
+		if ctx.IsSet("output") {
+			logFile = fmt.Sprintf("%s/%s", ctx.String("output"), logFile)
+		}
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			console.Fatalln("could not create + migration_log.txt", err)
+			return
+		}
+		f.WriteString(getHeader(ctx))
+		fwriter := bufio.NewWriter(f)
+		defer fwriter.Flush()
+		defer f.Close()
+
+		for {
+			select {
+			case <-globalContext.Done():
+				return
+			case res, ok := <-nodeState.logCh:
+				if !ok {
+					return
+				}
+				if _, err := f.WriteString(res.String() + "\n"); err != nil {
+					console.Errorln(fmt.Sprintf("Error writing to migration_log.txt for "+res.String(), err))
+					os.Exit(1)
+				}
+
+			}
 		}
 	}()
 	if e := ui.Start(); e != nil {
@@ -342,14 +413,31 @@ func title(s string) string {
 func opTitle(s string) string {
 	return titleStyle(s)
 }
+
+var style = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(lipgloss.Color("#FAFAFA")).Align(lipgloss.Left)
+
+//Background(lipgloss.Color("#7D56F4")).
+//	PaddingTop(2).
+//	PaddingLeft(4).
+//Width(22)
+
 func (m *resultsModel) View() string {
 	var s strings.Builder
+	s.WriteString(whiteStyle.Render("confess "))
+	s.WriteString(whiteStyle.Render(version + "\n"))
+
+	s.WriteString(whiteStyle.Render("Copyright MinIO\n"))
+	s.WriteString(whiteStyle.Render("GNU AGPL V3\n\n"))
+
 	if !m.quitting {
 		if m.cleanup {
 			s.WriteString(fmt.Sprintf("%s %s\n", console.Colorize("title", "confess last operation:"), console.Colorize("cleanup", "cleaning up bucket..")))
 		}
 		s.WriteString(fmt.Sprintf("%s %s at %s\n", console.Colorize("title", "confess last operation:"), m.metrics.lastOp, m.metrics.ops[m.metrics.lastOp].lastNode))
 	}
+
 	// Set table header
 	table := tablewriter.NewWriter(&s)
 	table.SetAutoWrapText(false)
