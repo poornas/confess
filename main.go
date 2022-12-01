@@ -16,7 +16,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -64,7 +63,18 @@ type nodeState struct {
 	cliCtx *cli.Context
 	buf    *objectsBuf
 	logCh  chan testResult
+	testCh chan Op
+	outFn  func(res testResult) // dummy - to removeß
+	wg     sync.WaitGroup
 }
+
+func (n *nodeState) queueTest(op Op) {
+	n.testCh <- op
+}
+
+var (
+	concurrency = 100
+)
 
 type ErrLog struct {
 }
@@ -180,14 +190,16 @@ func (m resultMsg) JSON() string {
 }
 
 type testResult struct {
-	Method   string        `json:"method"`
-	FuncName string        `json:"funcName"`
-	Path     string        `json:"path"`
-	Node     string        `json:"node"`
-	Err      error         `json:"err,omitempty"`
-	Latency  time.Duration `json:"duration"`
-	Final    bool          `json:"final"`
-	Cleanup  bool          `json:"cleanup"`
+	Method   string           `json:"method"`
+	FuncName string           `json:"funcName"`
+	Path     string           `json:"path"`
+	Node     string           `json:"node"`
+	Err      error            `json:"err,omitempty"`
+	Latency  time.Duration    `json:"duration"`
+	Final    bool             `json:"final"`
+	Cleanup  bool             `json:"cleanup"`
+	Offline  bool             `json:"offline"`
+	data     minio.ObjectInfo `json:"-"`
 }
 
 func (r *testResult) String() string {
@@ -309,7 +321,7 @@ func confessMain(ctx *cli.Context) {
 	nodeState := configureClients(ctx)
 	ui := tea.NewProgram(initUI())
 	go func() {
-		e := nodeState.runTests(globalContext, func(res testResult) {
+		outFn := func(res testResult) {
 			if globalJSON {
 				console.Println(resultMsg{Result: res})
 				return
@@ -322,43 +334,14 @@ func confessMain(ctx *cli.Context) {
 					return
 				}
 			}
-		})
+		}
+		nodeState.outFn = outFn // temp - to remove after refactor
+		e := nodeState.runTests(globalContext)
 		if e != nil && !errors.Is(e, context.Canceled) {
 			console.Fatalln(fmt.Errorf("unable to run confess: %w", e))
 		}
-
 	}()
-	go func() {
-		logFile := fmt.Sprintf("%s%s", "confess_log", time.Now().Format(".01-02-2006-15-04-05"))
-		if ctx.IsSet("output") {
-			logFile = fmt.Sprintf("%s/%s", ctx.String("output"), logFile)
-		}
-		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-		if err != nil {
-			console.Fatalln("could not create + migration_log.txt", err)
-			return
-		}
-		f.WriteString(getHeader(ctx))
-		fwriter := bufio.NewWriter(f)
-		defer fwriter.Flush()
-		defer f.Close()
 
-		for {
-			select {
-			case <-globalContext.Done():
-				return
-			case res, ok := <-nodeState.logCh:
-				if !ok {
-					return
-				}
-				if _, err := f.WriteString(res.String() + "\n"); err != nil {
-					console.Errorln(fmt.Sprintf("Error writing to migration_log.txt for "+res.String(), err))
-					os.Exit(1)
-				}
-
-			}
-		}
-	}()
 	if e := ui.Start(); e != nil {
 		globalCancel()
 		console.Fatalln("Unable to start confess")
@@ -408,7 +391,7 @@ var whiteStyle = lipgloss.NewStyle().
 	Foreground(lipgloss.Color("#ffffff"))
 
 func title(s string) string {
-	return titleStyle(s) //console.Colorize("title", s)
+	return titleStyle(s)
 }
 func opTitle(s string) string {
 	return titleStyle(s)

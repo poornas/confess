@@ -159,6 +159,7 @@ func configureClients(ctx *cli.Context) *nodeState {
 		buf:    newObjectsBuf(),
 		cliCtx: ctx,
 		logCh:  make(chan testResult, 100),
+		testCh: make(chan Op, 1000),
 	}
 }
 
