@@ -16,9 +16,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -32,6 +30,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/dustin/go-humanize"
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/minio-go/v7"
@@ -64,7 +63,6 @@ type nodeState struct {
 	buf    *objectsBuf
 	logCh  chan testResult
 	testCh chan Op
-	outFn  func(res testResult) // dummy - to removeß
 	wg     sync.WaitGroup
 }
 
@@ -173,22 +171,6 @@ func checkMain(ctx *cli.Context) {
 	}
 }
 
-type resultMsg struct {
-	Result testResult `json:"result"`
-}
-
-func (m resultMsg) JSON() string {
-	buf := &bytes.Buffer{}
-	enc := json.NewEncoder(buf)
-	enc.SetIndent("", " ")
-	// Disable escaping special chars to display XML tags correctly
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(m); err != nil {
-		console.Fatalln(fmt.Errorf("unable to marshal into JSON %w", err))
-	}
-	return buf.String()
-}
-
 type testResult struct {
 	Method   string           `json:"method"`
 	FuncName string           `json:"funcName"`
@@ -203,7 +185,11 @@ type testResult struct {
 }
 
 func (r *testResult) String() string {
-	return fmt.Sprintf("%s: %s %s %s %s", r.Node, r.Path, r.Method, r.FuncName, r.Err.Error())
+	var errMsg string
+	if r.Err != nil {
+		errMsg = r.Err.Error()
+	}
+	return fmt.Sprintf("%s: %s %s %s %s", r.Node, r.Path, r.Method, r.FuncName, errMsg)
 }
 
 type resultsModel struct {
@@ -315,33 +301,25 @@ func initUI() *resultsModel {
 }
 
 func confessMain(ctx *cli.Context) {
+	f, err := tea.LogToFile("confess_debug.log", "debug")
+	if err != nil {
+		fmt.Println("fatal:", err)
+		os.Exit(1)
+	}
+	defer f.Close()
 	checkMain(ctx)
 	rand.Seed(time.Now().UnixNano())
-
 	nodeState := configureClients(ctx)
 	ui := tea.NewProgram(initUI())
+	sendFn := ui.Send
+	nodeState.init(globalContext, sendFn)
+
 	go func() {
-		outFn := func(res testResult) {
-			if globalJSON {
-				console.Println(resultMsg{Result: res})
-				return
-			}
-			ui.Send(res)
-			if res.Err != nil {
-				select {
-				case nodeState.logCh <- res:
-				case <-globalContext.Done():
-					return
-				}
-			}
-		}
-		nodeState.outFn = outFn // temp - to remove after refactor
 		e := nodeState.runTests(globalContext)
 		if e != nil && !errors.Is(e, context.Canceled) {
 			console.Fatalln(fmt.Errorf("unable to run confess: %w", e))
 		}
 	}()
-
 	if e := ui.Start(); e != nil {
 		globalCancel()
 		console.Fatalln("Unable to start confess")
@@ -445,6 +423,7 @@ func (m *resultsModel) View() string {
 		s.WriteString("(waiting for data)")
 		return s.String()
 	}
+	addLine("", fmt.Sprintf("%d operations succeeded, %d failed in %s", metrics.numTests, metrics.numFailed, humanize.Time(metrics.startTime)))
 	addLine(title("Total Operations:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numTests, opTitle("PUT"), metrics.ops[http.MethodPut].total, opTitle("HEAD"), metrics.ops[http.MethodHead].total, opTitle("GET"), metrics.ops[http.MethodGet].total, opTitle("LIST"), metrics.ops["LIST"].total, opTitle("DEL"), metrics.ops[http.MethodDelete].total))
 	addLine(title("Total Failures:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numFailed, opTitle("PUT"), metrics.ops[http.MethodPut].failures, opTitle("HEAD"), metrics.ops[http.MethodHead].failures, opTitle("GET"), metrics.ops[http.MethodGet].failures, opTitle("LIST"), metrics.ops["LIST"].failures, opTitle("DEL"), metrics.ops[http.MethodDelete].failures))
 
