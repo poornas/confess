@@ -46,6 +46,7 @@ func getOp(verifier ObjVerifier) Op {
 	return Op{
 		Type:     http.MethodGet,
 		Verifier: verifier,
+		Key:      verifier.Key,
 	}
 }
 func statOp(verifier ObjVerifier) Op {
@@ -167,12 +168,13 @@ func (n *nodeState) addWorker(ctx context.Context) {
 		}
 	}()
 }
-func (n *nodeState) finish(ctx context.Context) {
-	close(n.testCh)
-	n.wg.Wait() // wait on workers to finish
-	// close(m.failedCh)
-	close(n.logCh)
-}
+
+// func (n *nodeState) finish(ctx context.Context) {
+// 	close(n.testCh)
+// 	n.wg.Wait() // wait on workers to finish
+// 	// close(m.failedCh)
+// 	close(n.logCh)
+// }
 func (n *nodeState) init(ctx context.Context, sendFn func(tea.Msg)) {
 	if n == nil {
 		return
@@ -210,12 +212,12 @@ func (n *nodeState) init(ctx context.Context, sendFn func(tea.Msg)) {
 					return
 				}
 				sendFn(res)
-				if res.Err != nil {
-					if _, err := f.WriteString(res.String() + "\n"); err != nil {
-						console.Errorln(fmt.Sprintf("Error writing to migration_log.txt for "+res.String(), err))
-						os.Exit(1)
-					}
+				//if res.Err != nil { . //temporarily for testing...
+				if _, err := f.WriteString(res.String() + "\n"); err != nil {
+					console.Errorln(fmt.Sprintf("Error writing to migration_log.txt for "+res.String(), err))
+					os.Exit(1)
 				}
+				//}
 			}
 		}
 	}()
@@ -415,12 +417,11 @@ func (n *nodeState) put(ctx context.Context, o putOpts) (res testResult) {
 	if err == nil {
 		n.buf.lock.Lock()
 		if len(n.buf.objects) < bufSize {
-			n.buf.objects = append(n.buf.objects, Object{Key: o.Object, VersionID: oi.VersionID})
+			n.buf.objects = append(n.buf.objects, Object{Key: o.Object, VersionID: oi.VersionID, ETag: oi.ETag})
 		} else {
+			// replace an object randomly in the buffer
 			idx := rand.Intn(len(n.buf.objects))
-			obj := n.buf.objects[idx]
-			go n.deleteTest(ctx, o.NodeIdx, obj.Key, obj.VersionID)
-			n.buf.objects[idx] = Object{Key: obj.Key, VersionID: obj.VersionID}
+			n.buf.objects[idx] = Object{Key: oi.Key, VersionID: oi.VersionID, ETag: oi.ETag}
 		}
 		n.buf.lock.Unlock()
 	}
@@ -473,6 +474,8 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 	opts := minio.StatObjectOptions{}
 	opts.SetMatchETag(o.Verifier.ETag)
 	oi, err := node.client.StatObject(ctx, o.Bucket, o.Object, opts)
+	fmt.Println("o.Verifier...", err, o.Verifier, "|", oi)
+
 	if err == nil {
 		if oi.ETag != o.Verifier.ETag ||
 			oi.VersionID != o.Verifier.VersionID ||
@@ -480,6 +483,10 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 			err = fmt.Errorf("metadata mismatch %s, %s, %s,%s, %d, %d", oi.ETag, o.Verifier.ETag, oi.VersionID, o.VersionID, oi.Size, o.Size)
 		}
 	}
+	// testing......
+	err = fmt.Errorf("request resource is unreadable %s", o.Object)
+	// testing......
+
 	return testResult{
 		Method:  http.MethodHead,
 		Path:    fmt.Sprintf("%s/%s", o.Bucket, o.Object),

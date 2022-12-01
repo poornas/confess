@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -191,8 +192,11 @@ func (r *testResult) String() string {
 }
 
 type resultsModel struct {
-	spinner  spinner.Model
-	metrics  *metrics
+	spinner spinner.Model
+	metrics *metrics
+
+	list list.Model
+
 	quitting bool
 	cleanup  bool
 }
@@ -288,15 +292,18 @@ func initUI() *resultsModel {
 	console.SetColor("cleanup", color.New(color.FgHiMagenta))
 
 	console.SetColor("node", color.New(color.FgCyan))
-
-	return &resultsModel{
+	items := make([]list.Item, 0)
+	m := resultsModel{
 		spinner: s,
 		metrics: &metrics{
 			ops:       make(map[string]opStats),
 			Failures:  make([]testResult, 0),
 			startTime: time.Now(),
 		},
+		list: list.New(items, list.NewDefaultDelegate(), 0, 0),
 	}
+	m.list.Title = "----Errors----"
+	return &m
 }
 
 func confessMain(ctx *cli.Context) {
@@ -329,7 +336,18 @@ func (m *resultsModel) Init() tea.Cmd {
 	return m.spinner.Tick
 }
 
+var docStyle = lipgloss.NewStyle().Margin(1, 2)
+
+type item struct {
+	title, desc string
+}
+
+func (i item) Title() string       { return i.title }
+func (i item) Description() string { return i.desc }
+func (i item) FilterValue() string { return i.title }
+
 func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
 	if m.quitting {
 		return m, tea.Quit
 	}
@@ -342,6 +360,9 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			return m, nil
 		}
+	case tea.WindowSizeMsg:
+		h, v := docStyle.GetFrameSize()
+		m.list.SetSize(msg.Width-h, msg.Height-v)
 	case testResult:
 		m.metrics.Update(msg)
 		if msg.Cleanup {
@@ -351,6 +372,10 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
+		m.list.InsertItem(len(m.list.Items()), item{
+			title: msg.Node,
+			desc:  msg.Path,
+		})
 		return m, nil
 		// case spinner.TickMsg:
 		// 	var cmd tea.Cmd
@@ -360,7 +385,10 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// var cmd tea.Cmd
 	// m.spinner, cmd = m.spinner.Update(msg)
-	return m, nil
+
+	m.list, cmd = m.list.Update(msg)
+	return m, cmd
+
 }
 
 var whiteStyle = lipgloss.NewStyle().
@@ -405,35 +433,37 @@ func (m *resultsModel) View() string {
 	m.metrics.mutex.RLock()
 	metrics := m.metrics.Clone()
 	m.metrics.mutex.RUnlock()
-	metrics.Failures = []testResult{
-		{Method: "HEAD", FuncName: "StatObject", Path: "bucket/prefix/obj1", Err: fmt.Errorf("requested Resource not readable"), Node: "localhost:9001"},
-		{Method: "GET", FuncName: "StatObject", Path: "bucket/prefix/obj2", Err: fmt.Errorf("xxrequested Resource not readable"), Node: "localhost:9002"},
-		{Method: "PUT", FuncName: "StatObject", Path: "bucket/prefix/obj3", Err: fmt.Errorf("xxrequested Resource not readable"), Node: "localhost:9001"},
-	}
-	for i := 0; i < rand.Intn(5); i++ {
-		msg := metrics.Failures[i%len(metrics.Failures)]
-		metrics.Failures = append(metrics.Failures, msg)
-	}
+	// metrics.Failures = []testResult{
+	// 	{Method: "HEAD", FuncName: "StatObject", Path: "bucket/prefix/obj1", Err: fmt.Errorf("requested Resource not readable"), Node: "localhost:9001"},
+	// 	{Method: "GET", FuncName: "StatObject", Path: "bucket/prefix/obj2", Err: fmt.Errorf("xxrequested Resource not readable"), Node: "localhost:9002"},
+	// 	{Method: "PUT", FuncName: "StatObject", Path: "bucket/prefix/obj3", Err: fmt.Errorf("xxrequested Resource not readable"), Node: "localhost:9001"},
+	// }
+	// for i := 0; i < rand.Intn(5); i++ {
+	// 	msg := metrics.Failures[i%len(metrics.Failures)]
+	// 	metrics.Failures = append(metrics.Failures, msg)
+	// }
 	if metrics.numTests == 0 {
 		s.WriteString("(waiting for data)")
 		return s.String()
 	}
 
 	if len(metrics.Failures) > 0 {
-		lim := 10
-		if len(metrics.Failures) < lim {
-			lim = len(metrics.Failures)
-		}
-		cnt := 0
 		s.WriteString("-----------------------------------------Errors------------------------------------------------------\n")
-		for idx, msg := range metrics.Failures[:lim] {
-			// console.Eraseline()
-			s.WriteString(msg.Node + ":" + console.Colorize("metrics-error", fmt.Sprintf("%s %s %d :%s\n", msg.Method, msg.Path, msg.Latency, msg.Err.Error())))
-			cnt = idx
-		}
-		for i := cnt + 1; i < lim; i++ {
-			s.WriteString("\n")
-		}
+
+		s.WriteString(docStyle.Render(m.list.View()))
+		// lim := 10
+		// if len(metrics.Failures) < lim {
+		// 	lim = len(metrics.Failures)
+		// }
+		// cnt := 0
+		// for idx, msg := range metrics.Failures[:lim] {
+		// 	// console.Eraseline()
+		// 	s.WriteString(msg.Node + ":" + console.Colorize("metrics-error", fmt.Sprintf("%s %s %d :%s\n", msg.Method, msg.Path, msg.Latency, msg.Err.Error())))
+		// 	cnt = idx
+		// }
+		// for i := cnt + 1; i < lim; i++ {
+		// 	s.WriteString("\n")
+		// }
 	}
 	// console.Eraseline()
 	// table.AppendBulk(data)
