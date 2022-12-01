@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -35,7 +34,6 @@ import (
 	"github.com/minio/cli"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/pkg/console"
-	"github.com/olekukonko/tablewriter"
 )
 
 const bufSize = 100
@@ -228,6 +226,7 @@ func (m *metrics) Clone() metrics {
 		ops:       ops,
 		Failures:  failures,
 		lastOp:    m.lastOp,
+		startTime: m.startTime,
 	}
 }
 func (m *metrics) Update(msg testResult) {
@@ -353,15 +352,15 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		return m, nil
-	case spinner.TickMsg:
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		return m, cmd
+		// case spinner.TickMsg:
+		// 	var cmd tea.Cmd
+		// 	m.spinner, cmd = m.spinner.Update(msg)
+		// 	return m, cmd
 	}
 
-	var cmd tea.Cmd
-	m.spinner, cmd = m.spinner.Update(msg)
-	return m, cmd
+	// var cmd tea.Cmd
+	// m.spinner, cmd = m.spinner.Update(msg)
+	return m, nil
 }
 
 var whiteStyle = lipgloss.NewStyle().
@@ -386,59 +385,61 @@ var style = lipgloss.NewStyle().
 
 func (m *resultsModel) View() string {
 	var s strings.Builder
-	s.WriteString(whiteStyle.Render("confess "))
-	s.WriteString(whiteStyle.Render(version + "\n"))
-
-	s.WriteString(whiteStyle.Render("Copyright MinIO\n"))
-	s.WriteString(whiteStyle.Render("GNU AGPL V3\n\n"))
-
-	if !m.quitting {
-		if m.cleanup {
-			s.WriteString(fmt.Sprintf("%s %s\n", console.Colorize("title", "confess last operation:"), console.Colorize("cleanup", "cleaning up bucket..")))
-		}
-		s.WriteString(fmt.Sprintf("%s %s at %s\n", console.Colorize("title", "confess last operation:"), m.metrics.lastOp, m.metrics.ops[m.metrics.lastOp].lastNode))
-	}
-
+	s.WriteString(whiteStyle.Render("confess " + version + "\nCopyright MinIO\nGNU AGPL V3\n\n"))
 	// Set table header
-	table := tablewriter.NewWriter(&s)
-	table.SetAutoWrapText(false)
-	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetBorder(true)
-	table.SetRowLine(false)
-	var data [][]string
+	// table := tablewriter.NewWriter(&s)
+	// table.SetAutoWrapText(false)
+	// table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	// table.SetAlignment(tablewriter.ALIGN_LEFT)
+	// table.SetBorder(true)
+	// table.SetRowLine(true)
+	// var data [][]string
 
-	addLine := func(prefix string, value interface{}) {
-		data = append(data, []string{
-			prefix,
-			fmt.Sprint(value),
-		})
-	}
+	// addLine := func(prefix string, value interface{}) {
+	// 	data = append(data, []string{
+	// 		prefix,
+	// 		fmt.Sprint(value),
+	// 	})
+	// }
 
 	m.metrics.mutex.RLock()
 	metrics := m.metrics.Clone()
 	m.metrics.mutex.RUnlock()
-
+	metrics.Failures = []testResult{
+		{Method: "HEAD", FuncName: "StatObject", Path: "bucket/prefix/obj1", Err: fmt.Errorf("requested Resource not readable"), Node: "localhost:9001"},
+		{Method: "GET", FuncName: "StatObject", Path: "bucket/prefix/obj2", Err: fmt.Errorf("xxrequested Resource not readable"), Node: "localhost:9002"},
+		{Method: "PUT", FuncName: "StatObject", Path: "bucket/prefix/obj3", Err: fmt.Errorf("xxrequested Resource not readable"), Node: "localhost:9001"},
+	}
+	for i := 0; i < rand.Intn(5); i++ {
+		msg := metrics.Failures[i%len(metrics.Failures)]
+		metrics.Failures = append(metrics.Failures, msg)
+	}
 	if metrics.numTests == 0 {
 		s.WriteString("(waiting for data)")
 		return s.String()
 	}
-	addLine("", fmt.Sprintf("%d operations succeeded, %d failed in %s", metrics.numTests, metrics.numFailed, humanize.Time(metrics.startTime)))
-	addLine(title("Total Operations:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numTests, opTitle("PUT"), metrics.ops[http.MethodPut].total, opTitle("HEAD"), metrics.ops[http.MethodHead].total, opTitle("GET"), metrics.ops[http.MethodGet].total, opTitle("LIST"), metrics.ops["LIST"].total, opTitle("DEL"), metrics.ops[http.MethodDelete].total))
-	addLine(title("Total Failures:"), fmt.Sprintf("%7d ; %s: %7d %s: %7d %s: %7d %s: %7d %s: %7d", metrics.numFailed, opTitle("PUT"), metrics.ops[http.MethodPut].failures, opTitle("HEAD"), metrics.ops[http.MethodHead].failures, opTitle("GET"), metrics.ops[http.MethodGet].failures, opTitle("LIST"), metrics.ops["LIST"].failures, opTitle("DEL"), metrics.ops[http.MethodDelete].failures))
 
 	if len(metrics.Failures) > 0 {
 		lim := 10
 		if len(metrics.Failures) < lim {
 			lim = len(metrics.Failures)
 		}
-		addLine("", "-----------------------------------------Errors------------------------------------------------------")
-		for _, s := range metrics.Failures[:lim] {
-			addLine(s.Node, console.Colorize("metrics-error", fmt.Sprintf("%s %s %d :%s", s.Method, s.Path, s.Latency, s.Err.Error())))
+		cnt := 0
+		s.WriteString("-----------------------------------------Errors------------------------------------------------------\n")
+		for idx, msg := range metrics.Failures[:lim] {
+			// console.Eraseline()
+			s.WriteString(msg.Node + ":" + console.Colorize("metrics-error", fmt.Sprintf("%s %s %d :%s\n", msg.Method, msg.Path, msg.Latency, msg.Err.Error())))
+			cnt = idx
+		}
+		for i := cnt + 1; i < lim; i++ {
+			s.WriteString("\n")
 		}
 	}
-	table.AppendBulk(data)
-	table.Render()
+	// console.Eraseline()
+	// table.AppendBulk(data)
+	s.WriteString(fmt.Sprintf("\n\n%d operations succeeded, %d failed in %s\n", metrics.numTests, metrics.numFailed, humanize.RelTime(metrics.startTime, time.Now(), "", "")))
+
+	// table.Render()
 
 	return s.String()
 }

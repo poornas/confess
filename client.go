@@ -98,6 +98,7 @@ func getClient(ctx *cli.Context, hostURL *url.URL) (*minio.Client, error) {
 func configureClients(ctx *cli.Context) *nodeState {
 	var endpoints []string
 	var nodes []*node
+	minio.MaxRetry = 1
 
 	for _, hostStr := range ctx.Args() {
 		hosts := strings.Split(hostStr, ",")
