@@ -98,7 +98,7 @@ func getClient(ctx *cli.Context, hostURL *url.URL) (*minio.Client, error) {
 func configureClients(ctx *cli.Context) *nodeState {
 	var endpoints []string
 	var nodes []*node
-	minio.MaxRetry = 1
+	//minio.MaxRetry = 1
 
 	for _, hostStr := range ctx.Args() {
 		hosts := strings.Split(hostStr, ",")
@@ -154,13 +154,17 @@ func configureClients(ctx *cli.Context) *nodeState {
 			Online:   true,
 		}
 	}
+	var pfxes []string
+	for i := 0; i < 10; i++ {
+		pfxes = append(pfxes, fmt.Sprintf("prefix%d", i))
+	}
 	return &nodeState{
-		nodes:  nodes,
-		hc:     newHealthChecker(ctx, hcMap),
-		buf:    newObjectsBuf(),
-		cliCtx: ctx,
-		logCh:  make(chan testResult, 100),
-		testCh: make(chan Op, 1000),
+		nodes:    nodes,
+		hc:       newHealthChecker(ctx, hcMap),
+		cliCtx:   ctx,
+		logCh:    make(chan testResult, 100),
+		testCh:   make(chan OpSequence, 1000),
+		Prefixes: pfxes,
 	}
 }
 

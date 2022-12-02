@@ -24,14 +24,13 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
-	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/dustin/go-humanize"
-	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/pkg/console"
@@ -56,16 +55,16 @@ type node struct {
 }
 
 type nodeState struct {
-	nodes  []*node
-	hc     *healthChecker
-	cliCtx *cli.Context
-	buf    *objectsBuf
-	logCh  chan testResult
-	testCh chan Op
-	wg     sync.WaitGroup
+	Prefixes []string
+	nodes    []*node
+	hc       *healthChecker
+	cliCtx   *cli.Context
+	logCh    chan testResult
+	testCh   chan OpSequence
+	wg       sync.WaitGroup
 }
 
-func (n *nodeState) queueTest(op Op) {
+func (n *nodeState) queueTest(op OpSequence) {
 	n.testCh <- op
 }
 
@@ -86,16 +85,6 @@ type objectsBuf struct {
 	prefixes []string
 }
 
-func newObjectsBuf() *objectsBuf {
-	var pfxes []string
-	for i := 0; i < 10; i++ {
-		pfxes = append(pfxes, fmt.Sprintf("prefix%d", i))
-	}
-	return &objectsBuf{
-		objects:  make([]Object, 0, bufSize),
-		prefixes: pfxes,
-	}
-}
 func main() {
 	app := cli.NewApp()
 	app.Name = os.Args[0]
@@ -183,6 +172,16 @@ type testResult struct {
 	data     minio.ObjectInfo `json:"-"`
 }
 
+func (r *testResult) ToItem() item {
+	var errMsg string
+	if r.Err != nil {
+		errMsg = r.Err.Error()
+	}
+	return item{
+		title: r.Node,
+		desc:  fmt.Sprintf("%s %s %s %s", r.Path, r.Method, r.FuncName, errMsg),
+	}
+}
 func (r *testResult) String() string {
 	var errMsg string
 	if r.Err != nil {
@@ -192,11 +191,7 @@ func (r *testResult) String() string {
 }
 
 type resultsModel struct {
-	spinner spinner.Model
-	metrics *metrics
-
-	list list.Model
-
+	metrics  *metrics
 	quitting bool
 	cleanup  bool
 }
@@ -211,9 +206,9 @@ type metrics struct {
 	startTime time.Time
 	mutex     sync.RWMutex
 	ops       map[string]opStats
-	numTests  int
-	numFailed int
-	Failures  []testResult
+	numTests  int32
+	numFailed int32
+	Failures  list.Model
 	lastOp    string
 }
 
@@ -222,13 +217,13 @@ func (m *metrics) Clone() metrics {
 	for k, v := range m.ops {
 		ops[k] = v
 	}
-	var failures []testResult
-	failures = append(failures, m.Failures...)
+	// var failures []testResult
+	// failures = append(failures, m.Failures...)
 	return metrics{
 		numTests:  m.numTests,
 		numFailed: m.numFailed,
 		ops:       ops,
-		Failures:  failures,
+		Failures:  m.Failures,
 		lastOp:    m.lastOp,
 		startTime: m.startTime,
 	}
@@ -246,7 +241,8 @@ func (m *metrics) Update(msg testResult) {
 	if msg.Err != nil {
 		stats.failures++
 		m.numFailed++
-		m.Failures = append(m.Failures, msg)
+		m.Failures.InsertItem(len(m.Failures.Items()), msg.ToItem())
+		// m.Failures = append(m.Failures, msg)
 	}
 	stats.total++
 	m.ops[msg.Method] = stats
@@ -279,30 +275,36 @@ func getHeader(ctx *cli.Context) string {
 	return s.String()
 }
 
-var titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#008080")).Render
+const listHeight = 14
+const defaultWidth = 20
+
+var (
+	titleStyle        = lipgloss.NewStyle().MarginLeft(2)
+	itemStyle         = lipgloss.NewStyle().PaddingLeft(4)
+	selectedItemStyle = lipgloss.NewStyle().PaddingLeft(2).Foreground(lipgloss.Color("170"))
+	paginationStyle   = list.DefaultStyles().PaginationStyle.PaddingLeft(4)
+	helpStyle         = list.DefaultStyles().HelpStyle.PaddingLeft(4).PaddingBottom(1)
+	quitTextStyle     = lipgloss.NewStyle().Margin(1, 0, 2, 4)
+)
+
+// var titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#008080")).Render
 
 func initUI() *resultsModel {
-	s := spinner.New()
-	s.Spinner = spinner.Points
-	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
-	console.SetColor("duration", color.New(color.FgHiWhite))
-	console.SetColor("path", color.New(color.FgGreen))
-	console.SetColor("error", color.New(color.FgHiRed))
-	console.SetColor("title", color.New(color.FgHiCyan))
-	console.SetColor("cleanup", color.New(color.FgHiMagenta))
-
-	console.SetColor("node", color.New(color.FgCyan))
 	items := make([]list.Item, 0)
 	m := resultsModel{
-		spinner: s,
 		metrics: &metrics{
 			ops:       make(map[string]opStats),
-			Failures:  make([]testResult, 0),
+			Failures:  list.New(items, list.NewDefaultDelegate(), defaultWidth, listHeight),
 			startTime: time.Now(),
 		},
-		list: list.New(items, list.NewDefaultDelegate(), 0, 0),
 	}
-	m.list.Title = "----Errors----"
+	m.metrics.Failures.Title = "----Errors----"
+	m.metrics.Failures.SetShowStatusBar(false)
+	m.metrics.Failures.SetFilteringEnabled(false)
+	m.metrics.Failures.Styles.Title = titleStyle
+	m.metrics.Failures.Styles.PaginationStyle = paginationStyle
+	m.metrics.Failures.Styles.HelpStyle = helpStyle
+
 	return &m
 }
 
@@ -316,7 +318,7 @@ func confessMain(ctx *cli.Context) {
 	checkMain(ctx)
 	rand.Seed(time.Now().UnixNano())
 	nodeState := configureClients(ctx)
-	ui := tea.NewProgram(initUI())
+	ui := tea.NewProgram(initUI(), tea.WithAltScreen())
 	sendFn := ui.Send
 	nodeState.init(globalContext, sendFn)
 
@@ -333,7 +335,7 @@ func confessMain(ctx *cli.Context) {
 }
 
 func (m *resultsModel) Init() tea.Cmd {
-	return m.spinner.Tick
+	return nil
 }
 
 var docStyle = lipgloss.NewStyle().Margin(1, 2)
@@ -362,7 +364,7 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.WindowSizeMsg:
 		h, v := docStyle.GetFrameSize()
-		m.list.SetSize(msg.Width-h, msg.Height-v)
+		m.metrics.Failures.SetSize(msg.Width-h, msg.Height-v)
 	case testResult:
 		m.metrics.Update(msg)
 		if msg.Cleanup {
@@ -372,21 +374,11 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-		m.list.InsertItem(len(m.list.Items()), item{
-			title: msg.Node,
-			desc:  msg.Path,
-		})
+		m.metrics.Failures.InsertItem(len(m.metrics.Failures.Items()), msg.ToItem())
 		return m, nil
-		// case spinner.TickMsg:
-		// 	var cmd tea.Cmd
-		// 	m.spinner, cmd = m.spinner.Update(msg)
-		// 	return m, cmd
 	}
 
-	// var cmd tea.Cmd
-	// m.spinner, cmd = m.spinner.Update(msg)
-
-	m.list, cmd = m.list.Update(msg)
+	m.metrics.Failures, cmd = m.metrics.Failures.Update(msg)
 	return m, cmd
 
 }
@@ -395,81 +387,20 @@ var whiteStyle = lipgloss.NewStyle().
 	Bold(true).
 	Foreground(lipgloss.Color("#ffffff"))
 
-func title(s string) string {
-	return titleStyle(s)
-}
-func opTitle(s string) string {
-	return titleStyle(s)
-}
-
-var style = lipgloss.NewStyle().
-	Bold(true).
-	Foreground(lipgloss.Color("#FAFAFA")).Align(lipgloss.Left)
-
-//Background(lipgloss.Color("#7D56F4")).
-//	PaddingTop(2).
-//	PaddingLeft(4).
-//Width(22)
-
 func (m *resultsModel) View() string {
 	var s strings.Builder
 	s.WriteString(whiteStyle.Render("confess " + version + "\nCopyright MinIO\nGNU AGPL V3\n\n"))
-	// Set table header
-	// table := tablewriter.NewWriter(&s)
-	// table.SetAutoWrapText(false)
-	// table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
-	// table.SetAlignment(tablewriter.ALIGN_LEFT)
-	// table.SetBorder(true)
-	// table.SetRowLine(true)
-	// var data [][]string
-
-	// addLine := func(prefix string, value interface{}) {
-	// 	data = append(data, []string{
-	// 		prefix,
-	// 		fmt.Sprint(value),
-	// 	})
-	// }
-
-	m.metrics.mutex.RLock()
-	metrics := m.metrics.Clone()
-	m.metrics.mutex.RUnlock()
-	// metrics.Failures = []testResult{
-	// 	{Method: "HEAD", FuncName: "StatObject", Path: "bucket/prefix/obj1", Err: fmt.Errorf("requested Resource not readable"), Node: "localhost:9001"},
-	// 	{Method: "GET", FuncName: "StatObject", Path: "bucket/prefix/obj2", Err: fmt.Errorf("xxrequested Resource not readable"), Node: "localhost:9002"},
-	// 	{Method: "PUT", FuncName: "StatObject", Path: "bucket/prefix/obj3", Err: fmt.Errorf("xxrequested Resource not readable"), Node: "localhost:9001"},
-	// }
-	// for i := 0; i < rand.Intn(5); i++ {
-	// 	msg := metrics.Failures[i%len(metrics.Failures)]
-	// 	metrics.Failures = append(metrics.Failures, msg)
-	// }
-	if metrics.numTests == 0 {
+	if atomic.LoadInt32(&m.metrics.numTests) == 0 {
 		s.WriteString("(waiting for data)")
 		return s.String()
 	}
 
-	if len(metrics.Failures) > 0 {
+	if len(m.metrics.Failures.Items()) > 0 {
 		s.WriteString("-----------------------------------------Errors------------------------------------------------------\n")
 
-		s.WriteString(docStyle.Render(m.list.View()))
-		// lim := 10
-		// if len(metrics.Failures) < lim {
-		// 	lim = len(metrics.Failures)
-		// }
-		// cnt := 0
-		// for idx, msg := range metrics.Failures[:lim] {
-		// 	// console.Eraseline()
-		// 	s.WriteString(msg.Node + ":" + console.Colorize("metrics-error", fmt.Sprintf("%s %s %d :%s\n", msg.Method, msg.Path, msg.Latency, msg.Err.Error())))
-		// 	cnt = idx
-		// }
-		// for i := cnt + 1; i < lim; i++ {
-		// 	s.WriteString("\n")
-		// }
+		s.WriteString(docStyle.Render(m.metrics.Failures.View()))
 	}
-	// console.Eraseline()
-	// table.AppendBulk(data)
-	s.WriteString(fmt.Sprintf("\n\n%d operations succeeded, %d failed in %s\n", metrics.numTests, metrics.numFailed, humanize.RelTime(metrics.startTime, time.Now(), "", "")))
-
-	// table.Render()
+	s.WriteString(fmt.Sprintf("\n\n%d operations succeeded, %d failed in %s\n", atomic.LoadInt32(&m.metrics.numTests), atomic.LoadInt32(&m.metrics.numFailed), humanize.RelTime(m.metrics.startTime, time.Now(), "", "")))
 
 	return s.String()
 }
