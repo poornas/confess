@@ -27,7 +27,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/dustin/go-humanize"
@@ -41,7 +43,6 @@ const bufSize = 100
 var (
 	version                     = "1.0.0"
 	globalContext, globalCancel = context.WithCancel(context.Background())
-	globalJSON                  bool
 )
 
 const (
@@ -167,21 +168,24 @@ type testResult struct {
 	Err      error            `json:"err,omitempty"`
 	Latency  time.Duration    `json:"duration"`
 	Final    bool             `json:"final"`
-	Cleanup  bool             `json:"cleanup"`
 	Offline  bool             `json:"offline"`
 	data     minio.ObjectInfo `json:"-"`
 }
 
-func (r *testResult) ToItem() item {
+func (r *testResult) toRow() table.Row {
 	var errMsg string
 	if r.Err != nil {
 		errMsg = r.Err.Error()
 	}
-	return item{
-		title: r.Node,
-		desc:  fmt.Sprintf("%s %s %s %s", r.Path, r.Method, r.FuncName, errMsg),
+
+	return table.Row{
+		r.Node,
+		r.Path,
+		r.Method,
+		errMsg,
 	}
 }
+
 func (r *testResult) String() string {
 	var errMsg string
 	if r.Err != nil {
@@ -190,10 +194,43 @@ func (r *testResult) String() string {
 	return fmt.Sprintf("%s: %s %s %s %s", r.Node, r.Path, r.Method, r.FuncName, errMsg)
 }
 
+type keyMap struct {
+	quit  key.Binding
+	up    key.Binding
+	down  key.Binding
+	enter key.Binding
+}
+
+func newKeyMap() keyMap {
+	return keyMap{
+		up: key.NewBinding(
+			key.WithKeys("k", "up", "left", "shift+tab"),
+			key.WithHelp("↑/k", "Move up"),
+		),
+		down: key.NewBinding(
+			key.WithKeys("j", "down", "right", "tab"),
+			key.WithHelp("↓/j", "Move down"),
+		),
+		enter: key.NewBinding(
+			key.WithKeys("enter", " "),
+			key.WithHelp("enter/spacebar", ""),
+		),
+		quit: key.NewBinding(
+			key.WithKeys("ctrl+c", "q"),
+			key.WithHelp("q", "quit"),
+		),
+	}
+}
+
 type resultsModel struct {
-	metrics  *metrics
+	metrics     *metrics
+	rows        []table.Row
+	table       table.Model
+	help        help.Model
+	keymap      keyMap
+	lastFailure testResult
+
 	quitting bool
-	cleanup  bool
 }
 
 type opStats struct {
@@ -208,7 +245,6 @@ type metrics struct {
 	ops       map[string]opStats
 	numTests  int32
 	numFailed int32
-	Failures  list.Model
 	lastOp    string
 }
 
@@ -223,16 +259,15 @@ func (m *metrics) Clone() metrics {
 		numTests:  m.numTests,
 		numFailed: m.numFailed,
 		ops:       ops,
-		Failures:  m.Failures,
 		lastOp:    m.lastOp,
 		startTime: m.startTime,
 	}
 }
-func (m *metrics) Update(msg testResult) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.lastOp = msg.Method
-	stats, ok := m.ops[msg.Method]
+func (m *resultsModel) updateMetrics(msg testResult) {
+	m.metrics.mutex.Lock()
+	defer m.metrics.mutex.Unlock()
+	m.metrics.lastOp = msg.Method
+	stats, ok := m.metrics.ops[msg.Method]
 	if !ok {
 		stats = opStats{}
 	}
@@ -240,13 +275,13 @@ func (m *metrics) Update(msg testResult) {
 	stats.latency = msg.Latency
 	if msg.Err != nil {
 		stats.failures++
-		m.numFailed++
-		m.Failures.InsertItem(len(m.Failures.Items()), msg.ToItem())
-		// m.Failures = append(m.Failures, msg)
+		m.metrics.numFailed++
+		m.rows = append(m.rows, msg.toRow())
 	}
 	stats.total++
-	m.ops[msg.Method] = stats
-	m.numTests++
+	m.metrics.ops[msg.Method] = stats
+	m.metrics.numTests++
+	m.lastFailure = msg
 }
 
 func getHeader(ctx *cli.Context) string {
@@ -275,36 +310,21 @@ func getHeader(ctx *cli.Context) string {
 	return s.String()
 }
 
-const listHeight = 14
-const defaultWidth = 20
-
-var (
-	titleStyle        = lipgloss.NewStyle().MarginLeft(2)
-	itemStyle         = lipgloss.NewStyle().PaddingLeft(4)
-	selectedItemStyle = lipgloss.NewStyle().PaddingLeft(2).Foreground(lipgloss.Color("170"))
-	paginationStyle   = list.DefaultStyles().PaginationStyle.PaddingLeft(4)
-	helpStyle         = list.DefaultStyles().HelpStyle.PaddingLeft(4).PaddingBottom(1)
-	quitTextStyle     = lipgloss.NewStyle().Margin(1, 0, 2, 4)
-)
-
-// var titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#008080")).Render
-
 func initUI() *resultsModel {
-	items := make([]list.Item, 0)
 	m := resultsModel{
+		keymap: newKeyMap(),
+		help:   help.New(),
 		metrics: &metrics{
 			ops:       make(map[string]opStats),
-			Failures:  list.New(items, list.NewDefaultDelegate(), defaultWidth, listHeight),
 			startTime: time.Now(),
 		},
 	}
-	m.metrics.Failures.Title = "----Errors----"
-	m.metrics.Failures.SetShowStatusBar(false)
-	m.metrics.Failures.SetFilteringEnabled(false)
-	m.metrics.Failures.Styles.Title = titleStyle
-	m.metrics.Failures.Styles.PaginationStyle = paginationStyle
-	m.metrics.Failures.Styles.HelpStyle = helpStyle
-
+	t := table.New(
+		table.WithColumns(m.getColumns()),
+		table.WithFocused(true),
+		table.WithHeight(0),
+	)
+	m.table = t
 	return &m
 }
 
@@ -338,15 +358,17 @@ func (m *resultsModel) Init() tea.Cmd {
 	return nil
 }
 
-var docStyle = lipgloss.NewStyle().Margin(1, 2)
-
-type item struct {
-	title, desc string
+func (m *resultsModel) getColumns() []table.Column {
+	return []table.Column{{Title: "Node", Width: 15}, {Title: "Path", Width: 20}, {Title: "Op", Width: 4}, {Title: "Error", Width: 40}}
 }
-
-func (i item) Title() string       { return i.title }
-func (i item) Description() string { return i.desc }
-func (i item) FilterValue() string { return i.title }
+func (m *resultsModel) helpView() string {
+	return "\n" + m.help.ShortHelpView([]key.Binding{
+		m.keymap.enter,
+		m.keymap.down,
+		m.keymap.up,
+		m.keymap.quit,
+	})
+}
 
 func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -356,50 +378,93 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "q", "esc", "ctrl+c":
+		case "esc":
+			if m.table.Focused() {
+				m.table.Blur()
+			} else {
+				m.table.Focus()
+			}
+		case "q", "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
+		case "enter":
+			m.table = table.New(
+				table.WithColumns(m.getColumns()),
+				table.WithRows(m.rows),
+				table.WithFocused(true),
+				table.WithHeight(5),
+			)
+			m.table.SetStyles(getTableStyles())
 		default:
-			return m, nil
 		}
-	case tea.WindowSizeMsg:
-		h, v := docStyle.GetFrameSize()
-		m.metrics.Failures.SetSize(msg.Width-h, msg.Height-v)
 	case testResult:
-		m.metrics.Update(msg)
-		if msg.Cleanup {
-			m.cleanup = true
-		}
+		m.updateMetrics(msg)
 		if msg.Final {
 			m.quitting = true
-			return m, tea.Quit
+			return m, nil
 		}
-		m.metrics.Failures.InsertItem(len(m.metrics.Failures.Items()), msg.ToItem())
-		return m, nil
-	}
 
-	m.metrics.Failures, cmd = m.metrics.Failures.Update(msg)
+		m.table.SetRows(m.rows)
+		if len(m.rows) > 0 {
+			m.table.SetHeight(5)
+		}
+		//m.table, cmd = m.table.Update(msg)
+		m.table.UpdateViewport()
+		m.table, cmd = m.table.Update(msg)
+		return m, cmd
+
+		// if len(m.rows) < 5 {
+		// 	return m, cmd
+		// }
+		// m.table = table.New(
+		// 	table.WithColumns(m.getColumns()),
+		// 	table.WithRows(m.rows),
+		// 	table.WithFocused(true),
+		// 	table.WithHeight(5),
+		// )
+		//m.table.SetStyles(getTableStyles())
+		//return m, nil
+	}
+	m.table, cmd = m.table.Update(msg)
 	return m, cmd
 
 }
+func getTableStyles() table.Styles {
+	ts := table.DefaultStyles()
+	ts.Header = ts.Header.
+		// BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Align(lipgloss.Left).
+		BorderBottom(true).
+		Bold(false)
+	ts.Selected = ts.Selected.
+		Foreground(lipgloss.Color("229")).
+		Background(lipgloss.Color("300")).
+		Bold(false)
+	return ts
+}
 
+var baseStyle = lipgloss.NewStyle().
+	//	BorderStyle(lipgloss.NormalBorder()).
+	BorderForeground(lipgloss.Color("240"))
 var whiteStyle = lipgloss.NewStyle().
 	Bold(true).
 	Foreground(lipgloss.Color("#ffffff"))
 
 func (m *resultsModel) View() string {
 	var s strings.Builder
+
 	s.WriteString(whiteStyle.Render("confess " + version + "\nCopyright MinIO\nGNU AGPL V3\n\n"))
 	if atomic.LoadInt32(&m.metrics.numTests) == 0 {
 		s.WriteString("(waiting for data)")
 		return s.String()
 	}
 
-	if len(m.metrics.Failures.Items()) > 0 {
-		s.WriteString("-----------------------------------------Errors------------------------------------------------------\n")
-
-		s.WriteString(docStyle.Render(m.metrics.Failures.View()))
+	if len(m.rows) > 0 {
+		s.WriteString(baseStyle.Render(m.table.View()))
+		s.WriteString(m.helpView())
 	}
+	// fmt.Println(len(m.rows), "should print operations...", m.metrics.numTests)
 	s.WriteString(fmt.Sprintf("\n\n%d operations succeeded, %d failed in %s\n", atomic.LoadInt32(&m.metrics.numTests), atomic.LoadInt32(&m.metrics.numFailed), humanize.RelTime(m.metrics.startTime, time.Now(), "", "")))
 
 	return s.String()

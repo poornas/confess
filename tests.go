@@ -49,9 +49,8 @@ func (n *nodeState) finishTest(ctx context.Context) {
 	}
 	if clnt == nil {
 		n.logCh <- testResult{
-			Method:  http.MethodDelete,
-			Err:     fmt.Errorf("all nodes offline"),
-			Cleanup: true,
+			Method: http.MethodDelete,
+			Err:    fmt.Errorf("all nodes offline"),
 		}
 		return
 	}
@@ -66,7 +65,6 @@ func (n *nodeState) finishTest(ctx context.Context) {
 				Node:    n.nodes[nodeIdx].endpointURL.Host,
 				Err:     err,
 				Latency: time.Since(start),
-				Cleanup: true,
 			}
 			continue
 		}
@@ -136,12 +134,12 @@ func (n *nodeState) init(ctx context.Context, sendFn func(tea.Msg)) {
 					return
 				}
 				sendFn(res)
-				if res.Err != nil {
-					if _, err := f.WriteString(res.String() + "\n"); err != nil {
-						console.Errorln(fmt.Sprintf("Error writing to confess_log for "+res.String(), err))
-						os.Exit(1)
-					}
+				//if res.Err != nil {
+				if _, err := f.WriteString(res.String() + "\n"); err != nil {
+					console.Errorln(fmt.Sprintf("Error writing to confess_log for "+res.String(), err))
+					os.Exit(1)
 				}
+				//}
 			}
 		}
 	}()
@@ -200,7 +198,7 @@ func validateOpSequence(seq OpSequence) error {
 	return nil
 }
 func (n *nodeState) runOpSeq(ctx context.Context, seq OpSequence) {
-	var res testResult
+	var oi minio.ObjectInfo
 	if err := validateOpSequence(seq); err != nil {
 		console.Errorln(err)
 		return
@@ -208,16 +206,17 @@ func (n *nodeState) runOpSeq(ctx context.Context, seq OpSequence) {
 	for _, op := range seq.Ops {
 		if op.Type == http.MethodPut {
 			op.NodeIdx = rand.Intn(len(n.nodes))
-			res = n.runTest(ctx, op.NodeIdx, op)
+			res := n.runTest(ctx, op.NodeIdx, op)
 			if res.Err != nil { // discard all other ops in this sequence
 				return
 			}
+			oi = res.data
 			n.logCh <- res
 			continue
 		}
 		if op.Type == http.MethodDelete {
 			op.NodeIdx = rand.Intn(len(n.nodes))
-			res = n.runTest(ctx, op.NodeIdx, op)
+			res := n.runTest(ctx, op.NodeIdx, op)
 			n.logCh <- res
 			continue
 		}
@@ -227,9 +226,9 @@ func (n *nodeState) runOpSeq(ctx context.Context, seq OpSequence) {
 			go func(i int) {
 				defer wg.Done()
 				op.NodeIdx = i
-				op.VersionID = res.data.VersionID
-				op.ObjInfo.ETag = res.data.ETag
-				op.ObjInfo.Size = res.data.Size
+				op.ObjInfo.VersionID = oi.VersionID
+				op.ObjInfo.ETag = oi.ETag
+				op.ObjInfo.Size = oi.Size
 				res2 := n.runTest(ctx, op.NodeIdx, op)
 				n.logCh <- res2
 			}(i)
@@ -421,7 +420,7 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 		if oi.ETag != o.ObjInfo.ETag ||
 			oi.VersionID != o.ObjInfo.VersionID ||
 			oi.Size != o.ObjInfo.Size {
-			err = fmt.Errorf("metadata mismatch %s, %s, %s,%s, %d, %d", oi.ETag, o.ObjInfo.ETag, oi.VersionID, o.VersionID, oi.Size, o.Size)
+			err = fmt.Errorf("metadata mismatch: %s, %s, %s,%s, %d, %d", oi.ETag, o.ObjInfo.ETag, oi.VersionID, o.ObjInfo.VersionID, oi.Size, o.Size)
 		}
 	}
 	// testing......
