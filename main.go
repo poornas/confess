@@ -223,13 +223,13 @@ func newKeyMap() keyMap {
 }
 
 type resultsModel struct {
-	metrics     *metrics
-	rows        []table.Row
-	table       table.Model
-	help        help.Model
-	keymap      keyMap
-	lastFailure testResult
-
+	metrics  *metrics
+	rows     []table.Row
+	table    table.Model
+	help     help.Model
+	keymap   keyMap
+	nlock    sync.RWMutex
+	nodeMap  map[string]bool
 	quitting bool
 }
 
@@ -275,12 +275,14 @@ func (m *resultsModel) updateMetrics(msg testResult) {
 	stats.latency = msg.Latency
 	if msg.Err != nil {
 		stats.failures++
-		m.metrics.numFailed++
-		m.rows = append(m.rows, msg.toRow())
+		atomic.AddInt32(&m.metrics.numFailed, 1)
+		if len(m.rows) < 1000 {
+			m.rows = append(m.rows, msg.toRow())
+		}
 	}
 	stats.total++
 	m.metrics.ops[msg.Method] = stats
-	m.metrics.numTests++
+	atomic.AddInt32(&m.metrics.numTests, 1)
 	m.lastFailure = msg
 }
 
@@ -324,6 +326,7 @@ func initUI() *resultsModel {
 		table.WithFocused(true),
 		table.WithHeight(0),
 	)
+	t.SetStyles(getTableStyles())
 	m.table = t
 	return &m
 }
@@ -358,9 +361,6 @@ func (m *resultsModel) Init() tea.Cmd {
 	return nil
 }
 
-func (m *resultsModel) getColumns() []table.Column {
-	return []table.Column{{Title: "Node", Width: 15}, {Title: "Path", Width: 20}, {Title: "Op", Width: 4}, {Title: "Error", Width: 40}}
-}
 func (m *resultsModel) helpView() string {
 	return "\n" + m.help.ShortHelpView([]key.Binding{
 		m.keymap.enter,
@@ -408,33 +408,18 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.rows) > 0 {
 			m.table.SetHeight(5)
 		}
-		//m.table, cmd = m.table.Update(msg)
 		m.table.UpdateViewport()
 		m.table, cmd = m.table.Update(msg)
 		return m, cmd
-
-		// if len(m.rows) < 5 {
-		// 	return m, cmd
-		// }
-		// m.table = table.New(
-		// 	table.WithColumns(m.getColumns()),
-		// 	table.WithRows(m.rows),
-		// 	table.WithFocused(true),
-		// 	table.WithHeight(5),
-		// )
-		//m.table.SetStyles(getTableStyles())
-		//return m, nil
 	}
 	m.table, cmd = m.table.Update(msg)
 	return m, cmd
-
 }
+
 func getTableStyles() table.Styles {
 	ts := table.DefaultStyles()
 	ts.Header = ts.Header.
-		// BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("240")).
-		Align(lipgloss.Left).
 		BorderBottom(true).
 		Bold(false)
 	ts.Selected = ts.Selected.
@@ -444,27 +429,59 @@ func getTableStyles() table.Styles {
 	return ts
 }
 
+func (m *resultsModel) getColumns() []table.Column {
+	return []table.Column{
+		{Title: "Node", Width: 20},
+		{Title: "Path", Width: 30},
+		{Title: "Op", Width: 4},
+		{Title: "Error", Width: 40}}
+}
+
 var baseStyle = lipgloss.NewStyle().
-	//	BorderStyle(lipgloss.NormalBorder()).
+	Align(lipgloss.Left).
 	BorderForeground(lipgloss.Color("240"))
+
 var whiteStyle = lipgloss.NewStyle().
 	Bold(true).
+	AlignHorizontal(lipgloss.Left).
 	Foreground(lipgloss.Color("#ffffff"))
+var subtle = lipgloss.AdaptiveColor{Light: "#D9DCCF", Dark: "#383838"}
+var special = lipgloss.AdaptiveColor{Light: "#43BF6D", Dark: "#73F59F"}
+
+var divider = lipgloss.NewStyle().
+	SetString("•").
+	Padding(0, 1).
+	Foreground(subtle).
+	String()
+var (
+	advisory  = lipgloss.NewStyle().Foreground(special).Render
+	infoStyle = lipgloss.NewStyle().
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderTop(true).
+			BorderForeground(subtle)
+	descStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
+		Light: "#B2B2B2",
+		Dark:  "#4A4A4A",
+	})
+)
 
 func (m *resultsModel) View() string {
 	var s strings.Builder
-
-	s.WriteString(whiteStyle.Render("confess " + version + "\nCopyright MinIO\nGNU AGPL V3\n\n"))
+	s.WriteString(whiteStyle.Render("confess " + version + "\nCopyright MinIO\nGNU AGPL V3\n"))
 	if atomic.LoadInt32(&m.metrics.numTests) == 0 {
 		s.WriteString("(waiting for data)")
 		return s.String()
 	}
 
 	if len(m.rows) > 0 {
+		block := lipgloss.PlaceHorizontal(80, lipgloss.Center, "Consistency Errors"+divider)
+		row := lipgloss.JoinHorizontal(lipgloss.Left, block)
+
+		s.WriteString(row + "\n")
 		s.WriteString(baseStyle.Render(m.table.View()))
 		s.WriteString(m.helpView())
 	}
-	// fmt.Println(len(m.rows), "should print operations...", m.metrics.numTests)
+
 	s.WriteString(fmt.Sprintf("\n\n%d operations succeeded, %d failed in %s\n", atomic.LoadInt32(&m.metrics.numTests), atomic.LoadInt32(&m.metrics.numFailed), humanize.RelTime(m.metrics.startTime, time.Now(), "", "")))
 
 	return s.String()
