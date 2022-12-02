@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,7 +39,7 @@ import (
 	"github.com/minio/pkg/console"
 )
 
-const bufSize = 100
+const bufSize = 1000
 
 var (
 	version                     = "1.0.0"
@@ -62,7 +63,9 @@ type nodeState struct {
 	cliCtx   *cli.Context
 	logCh    chan testResult
 	testCh   chan OpSequence
+	m        *Model
 	wg       sync.WaitGroup
+	lwg      sync.WaitGroup
 }
 
 func (n *nodeState) queueTest(op OpSequence) {
@@ -73,17 +76,10 @@ var (
 	concurrency = 100
 )
 
-type ErrLog struct {
-}
 type Object struct {
 	Key       string
 	VersionID string
 	ETag      string
-}
-type objectsBuf struct {
-	lock     sync.RWMutex
-	objects  []Object
-	prefixes []string
 }
 
 func main() {
@@ -222,15 +218,17 @@ func newKeyMap() keyMap {
 	}
 }
 
-type resultsModel struct {
-	// metrics *metrics
-	rows    []table.Row
-	table   table.Model
-	help    help.Model
-	keymap  keyMap
-	nlock   sync.RWMutex
-	nodeMap map[string]bool
+type Model struct {
+	rows   []table.Row
+	table  table.Model
+	help   help.Model
+	keymap keyMap
 
+	// track offline nodes
+	nlock      sync.RWMutex
+	offlineMap map[string]bool
+
+	// stats
 	startTime time.Time
 	numTests  int32
 	numFailed int32
@@ -239,50 +237,43 @@ type resultsModel struct {
 	quitting bool
 }
 
-// type opStats struct {
-// 	total    int
-// 	failures int
-// 	lastNode string
-// 	latency  time.Duration
-// }
-
-// type metrics struct {
-// 	mutex sync.RWMutex
-// 	ops   map[string]opStats
-// }
-
-// func (m *metrics) Clone() metrics {
-// 	ops := make(map[string]opStats, len(m.ops))
-// 	for k, v := range m.ops {
-// 		ops[k] = v
-// 	}
-// 	// var failures []testResult
-// 	// failures = append(failures, m.Failures...)
-// 	return metrics{
-// 		numTests:  m.numTests,
-// 		numFailed: m.numFailed,
-// 		ops:       ops,
-// 		lastOp:    m.lastOp,
-// 		startTime: m.startTime,
-// 	}
-// }
-func (m *resultsModel) updateModel(msg testResult) {
+func (m *Model) updateModel(msg testResult) {
 	m.lastOp = msg.Method
-	atomic.AddInt32(&m.numTests, 1)
-	if msg.Err != nil {
-		atomic.AddInt32(&m.numFailed, 1)
-		if len(m.rows) < 1000 {
-			m.rows = append(m.rows, msg.toRow())
+	if !errors.Is(msg.Err, errNodeOffline) {
+		atomic.AddInt32(&m.numTests, 1)
+		if msg.Err != nil {
+			atomic.AddInt32(&m.numFailed, 1)
+			if len(m.rows) < bufSize {
+				m.rows = append(m.rows, msg.toRow())
+			}
 		}
 	}
-	m.nlock.Lock() // toggle node online/offline status
-	status, ok := m.nodeMap[msg.Node]
-	if !ok || status != msg.Offline {
-		m.nodeMap[msg.Node] = msg.Offline
+
+	m.nlock.Lock()
+	_, ok := m.offlineMap[msg.Node]
+
+	if !ok && msg.Offline {
+		m.offlineMap[msg.Node] = msg.Offline
+	}
+	if !msg.Offline && ok {
+		delete(m.offlineMap, msg.Node)
 	}
 	m.nlock.Unlock()
 }
 
+func (m *Model) helpView() string {
+	return "\n" + m.help.ShortHelpView([]key.Binding{
+		m.keymap.enter,
+		m.keymap.down,
+		m.keymap.up,
+		m.keymap.quit,
+	})
+}
+
+func (m *Model) summaryMsg() string {
+	success := atomic.LoadInt32(&m.numTests) - atomic.LoadInt32(&m.numFailed)
+	return fmt.Sprintf("Operations succeeded=%d Operations Failed=%d Duration=%s", success, atomic.LoadInt32(&m.numFailed), humanize.RelTime(m.startTime, time.Now(), "", ""))
+}
 func getHeader(ctx *cli.Context) string {
 	var s strings.Builder
 	s.WriteString("confess " + version + " ")
@@ -309,15 +300,12 @@ func getHeader(ctx *cli.Context) string {
 	return s.String()
 }
 
-func initUI() *resultsModel {
-	m := resultsModel{
-		keymap: newKeyMap(),
-		help:   help.New(),
-		// metrics: &metrics{
-		// 	startTime: time.Now(),
-		// },
-		startTime: time.Now(),
-		nodeMap:   make(map[string]bool),
+func initUI() *Model {
+	m := Model{
+		keymap:     newKeyMap(),
+		help:       help.New(),
+		startTime:  time.Now(),
+		offlineMap: make(map[string]bool),
 	}
 	t := table.New(
 		table.WithColumns(m.getColumns()),
@@ -339,12 +327,15 @@ func confessMain(ctx *cli.Context) {
 	checkMain(ctx)
 	rand.Seed(time.Now().UnixNano())
 	nodeState := configureClients(ctx)
-	ui := tea.NewProgram(initUI(), tea.WithAltScreen())
+	model := initUI()
+	nodeState.m = model
+	ui := tea.NewProgram(model, tea.WithAltScreen())
 	sendFn := ui.Send
 	nodeState.init(globalContext, sendFn)
 
 	go func() {
 		e := nodeState.runTests(globalContext)
+		fmt.Println("------e----------", e)
 		if e != nil && !errors.Is(e, context.Canceled) {
 			console.Fatalln(fmt.Errorf("unable to run confess: %w", e))
 		}
@@ -355,20 +346,11 @@ func confessMain(ctx *cli.Context) {
 	}
 }
 
-func (m *resultsModel) Init() tea.Cmd {
+func (m *Model) Init() tea.Cmd {
 	return nil
 }
 
-func (m *resultsModel) helpView() string {
-	return "\n" + m.help.ShortHelpView([]key.Binding{
-		m.keymap.enter,
-		m.keymap.down,
-		m.keymap.up,
-		m.keymap.quit,
-	})
-}
-
-func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	if m.quitting {
 		return m, tea.Quit
@@ -421,13 +403,13 @@ func getTableStyles() table.Styles {
 		BorderBottom(true).
 		Bold(false)
 	ts.Selected = ts.Selected.
-		Foreground(lipgloss.Color("229")).
-		Background(lipgloss.Color("300")).
+		Foreground(lipgloss.Color("229")). //cacfca 229,300
+		Background(lipgloss.Color("245")).
 		Bold(false)
 	return ts
 }
 
-func (m *resultsModel) getColumns() []table.Column {
+func (m *Model) getColumns() []table.Column {
 	return []table.Column{
 		{Title: "Node", Width: 20},
 		{Title: "Path", Width: 30},
@@ -435,31 +417,31 @@ func (m *resultsModel) getColumns() []table.Column {
 		{Title: "Error", Width: 40}}
 }
 
-var baseStyle = lipgloss.NewStyle().
-	Align(lipgloss.Left).
-	BorderForeground(lipgloss.Color("240"))
-
-var whiteStyle = lipgloss.NewStyle().
-	Bold(true).
-	AlignHorizontal(lipgloss.Left).
-	Foreground(lipgloss.Color("#ffffff"))
-var subtle = lipgloss.AdaptiveColor{Light: "#D9DCCF", Dark: "#383838"}
-var special = lipgloss.AdaptiveColor{Light: "#43BF6D", Dark: "#73F59F"}
-
-var divider = lipgloss.NewStyle().
-	SetString("•").
-	Padding(0, 1).
-	Foreground(subtle).
-	String()
 var (
-	advisory  = lipgloss.NewStyle().Foreground(special).Render
-	infoStyle = lipgloss.NewStyle().
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderTop(true).
-			BorderForeground(subtle)
+	baseStyle = lipgloss.NewStyle().
+			Align(lipgloss.Left).
+			BorderForeground(lipgloss.Color("240"))
+
+	whiteStyle = lipgloss.NewStyle().
+			Bold(true).
+			AlignHorizontal(lipgloss.Left).
+			Foreground(lipgloss.Color("#ffffff"))
+	subtle    = lipgloss.AdaptiveColor{Light: "#D9DCCF", Dark: "#383838"}
+	warnColor = lipgloss.AdaptiveColor{Light: "#bf4364", Dark: "#e31441"}
+	//special   = lipgloss.AdaptiveColor{Light: "#43BF6D", Dark: "#73F59F"}
+	special = lipgloss.AdaptiveColor{Light: "#22E32F", Dark: "#07E316"}
+
+	divider = lipgloss.NewStyle().
+		SetString("•").
+		Padding(0, 1).
+		Foreground(subtle).
+		String()
+
+	advisory = lipgloss.NewStyle().Foreground(special).Render
+	warn     = lipgloss.NewStyle().Foreground(warnColor).Render
 )
 
-func (m *resultsModel) View() string {
+func (m *Model) View() string {
 	var s strings.Builder
 	s.WriteString(whiteStyle.Render("confess " + version + "\nCopyright MinIO\nGNU AGPL V3\n"))
 	if atomic.LoadInt32(&m.numTests) == 0 {
@@ -475,8 +457,18 @@ func (m *resultsModel) View() string {
 		s.WriteString(baseStyle.Render(m.table.View()))
 		s.WriteString(m.helpView())
 	}
+	success := atomic.LoadInt32(&m.numTests) - atomic.LoadInt32(&m.numFailed)
+	s.WriteString(fmt.Sprintf("\n\n%d %s %d %s %s\n\n", success, advisory("operations succeeded"), atomic.LoadInt32(&m.numFailed), warn("failed")+" in", humanize.RelTime(m.startTime, time.Now(), "", "")))
+	m.nlock.RLock()
+	nodes := []string{}
+	for node := range m.offlineMap {
+		nodes = append(nodes, node)
+	}
+	m.nlock.RUnlock()
+	sort.Strings(nodes)
+	for _, node := range nodes {
+		s.WriteString(divider + whiteStyle.Render(node) + " is " + warn("offline") + "\n")
 
-	s.WriteString(fmt.Sprintf("\n\n%d operations succeeded, %d failed in %s\n", atomic.LoadInt32(&m.numTests), atomic.LoadInt32(&m.numFailed), humanize.RelTime(m.startTime, time.Now(), "", "")))
-
+	}
 	return s.String()
 }

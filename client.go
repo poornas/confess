@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -175,45 +174,4 @@ func mustGetSystemCertPool() *x509.CertPool {
 		return x509.NewCertPool()
 	}
 	return pool
-}
-
-// getCertPool - return system CAs or load CA from file if flag specified
-func getCertPool(cacert string) *x509.CertPool {
-	if cacert == "" {
-		return mustGetSystemCertPool()
-	}
-
-	pool := x509.NewCertPool()
-	caPEM, err := ioutil.ReadFile(cacert)
-	if err != nil {
-		console.Fatalln(fmt.Errorf("unable to load CA certificate: %s", err))
-	}
-	ok := pool.AppendCertsFromPEM([]byte(caPEM))
-	if !ok {
-		console.Fatalln(fmt.Errorf("unable to load CA certificate: %s is not valid certificate", cacert))
-	}
-	return pool
-}
-
-// getCertKeyPair - load client certificate and key pair from file if specified
-func getCertKeyPair(cert, key string) []tls.Certificate {
-	if cert == "" && key == "" {
-		return nil
-	}
-	if cert == "" || key == "" {
-		console.Fatalln(fmt.Errorf("both --cert and --key flags must be specified"))
-	}
-	certPEM, err := ioutil.ReadFile(cert)
-	if err != nil {
-		console.Fatalln(fmt.Errorf("unable to load certificate: %s", err))
-	}
-	keyPEM, err := ioutil.ReadFile(key)
-	if err != nil {
-		console.Fatalln(fmt.Errorf("unable to load key: %s", err))
-	}
-	keyPair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
-	if err != nil {
-		console.Fatalln(fmt.Errorf("%s", err))
-	}
-	return []tls.Certificate{keyPair}
 }

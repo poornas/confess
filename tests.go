@@ -33,7 +33,10 @@ type OpSeq struct {
 	Ops []Op
 }
 
-var errInvalidOpSeq = fmt.Errorf("invalid op sequence")
+var (
+	errInvalidOpSeq = fmt.Errorf("invalid op sequence")
+	errNodeOffline  = fmt.Errorf("node is offline")
+)
 
 func (n *nodeState) finishTest(ctx context.Context) {
 	bucket := n.cliCtx.String("bucket")
@@ -100,6 +103,7 @@ func (n *nodeState) finish(ctx context.Context) {
 	close(n.testCh)
 	n.wg.Wait() // wait on workers to finish
 	close(n.logCh)
+	n.lwg.Wait()
 }
 func (n *nodeState) init(ctx context.Context, sendFn func(tea.Msg)) {
 	if n == nil {
@@ -108,8 +112,12 @@ func (n *nodeState) init(ctx context.Context, sendFn func(tea.Msg)) {
 	for i := 0; i < concurrency; i++ {
 		n.addWorker(ctx)
 	}
+	n.lwg.Add(1)
 
 	go func() {
+		defer n.lwg.Done()
+		fmt.Println("------log--------routine///")
+		defer fmt.Println("------log--------routineend///")
 		logFile := fmt.Sprintf("%s%s", "confess_log", time.Now().Format(".01-02-2006-15-04-05"))
 		if n.cliCtx.IsSet("output") {
 			logFile = fmt.Sprintf("%s/%s", n.cliCtx.String("output"), logFile)
@@ -121,12 +129,21 @@ func (n *nodeState) init(ctx context.Context, sendFn func(tea.Msg)) {
 		}
 		f.WriteString(getHeader(n.cliCtx))
 		fwriter := bufio.NewWriter(f)
-		defer fwriter.Flush()
-		defer f.Close()
+		defer func() {
+			fmt.Println("------------clean up----------------------")
+			if _, err := f.WriteString(n.m.summaryMsg() + "\n"); err != nil {
+				console.Errorln(fmt.Sprintf("Error writing summary to confess_log: %s", err.Error()))
+				os.Exit(1)
+			}
+			defer fwriter.Flush()
+			defer f.Close()
+			fmt.Println("------------clean up end----------------------")
 
+		}()
 		for {
 			select {
 			case <-globalContext.Done():
+
 				n.finish(context.Background())
 				return
 			case res, ok := <-n.logCh:
@@ -134,12 +151,12 @@ func (n *nodeState) init(ctx context.Context, sendFn func(tea.Msg)) {
 					return
 				}
 				sendFn(res)
-				//if res.Err != nil {
-				if _, err := f.WriteString(res.String() + "\n"); err != nil {
-					console.Errorln(fmt.Sprintf("Error writing to confess_log for "+res.String(), err))
-					os.Exit(1)
+				if res.Err != nil {
+					if _, err := f.WriteString(res.String() + "\n"); err != nil {
+						console.Errorln(fmt.Sprintf("Error writing to confess_log for "+res.String(), err))
+						os.Exit(1)
+					}
 				}
-				//}
 			}
 		}
 	}()
@@ -197,6 +214,7 @@ func validateOpSequence(seq OpSequence) error {
 	}
 	return nil
 }
+
 func (n *nodeState) runOpSeq(ctx context.Context, seq OpSequence) {
 	var oi minio.ObjectInfo
 	if err := validateOpSequence(seq); err != nil {
@@ -241,6 +259,9 @@ func (n *nodeState) runTest(ctx context.Context, idx int, op Op) (res testResult
 	bucket := n.cliCtx.String("bucket")
 	node := n.nodes[idx]
 	if n.hc.isOffline(node.endpointURL) {
+		res.Offline = true
+		res.Err = errNodeOffline
+		res.Node = node.endpointURL.Host
 		return
 	}
 	switch op.Type {
@@ -352,22 +373,18 @@ func (n *nodeState) put(ctx context.Context, o putOpts) (res testResult) {
 	reader := getDataReader(o.Size)
 	defer reader.Close()
 	node := n.nodes[o.NodeIdx]
+	res = testResult{
+		Method: http.MethodPut,
+		Path:   fmt.Sprintf("%s/%s", o.Bucket, o.Object),
+		Node:   n.nodes[o.NodeIdx].endpointURL.Host,
+	}
 	if n.hc.isOffline(node.endpointURL) {
 		res.Offline = true
+		res.Err = errNodeOffline
 		return
 	}
 	oi, err := node.client.PutObject(ctx, o.Bucket, o.Object, reader, int64(o.Size), minio.PutObjectOptions{ContentType: "binary/octet-stream"})
-	//if err == nil {
-	// n.buf.lock.Lock()
-	// if len(n.buf.objects) < bufSize {
-	// 	n.buf.objects = append(n.buf.objects, Object{Key: o.Object, VersionID: oi.VersionID, ETag: oi.ETag})
-	// } else {
-	// 	// replace an object randomly in the buffer
-	// 	idx := rand.Intn(len(n.buf.objects))
-	// 	n.buf.objects[idx] = Object{Key: oi.Key, VersionID: oi.VersionID, ETag: oi.ETag}
-	// }
-	// n.buf.lock.Unlock()
-	//}
+
 	return testResult{
 		Method:  http.MethodPut,
 		Path:    fmt.Sprintf("%s/%s", o.Bucket, o.Object),
@@ -382,8 +399,14 @@ func (n *nodeState) get(ctx context.Context, o getOpts) (res testResult) {
 	start := time.Now()
 
 	node := n.nodes[o.NodeIdx]
+	res = testResult{
+		Method: http.MethodGet,
+		Path:   fmt.Sprintf("%s/%s", o.Bucket, o.Object),
+		Node:   n.nodes[o.NodeIdx].endpointURL.Host,
+	}
 	if n.hc.isOffline(node.endpointURL) {
 		res.Offline = true
+		res.Err = errNodeOffline
 		return
 	}
 	opts := minio.GetObjectOptions{}
@@ -409,8 +432,14 @@ func (n *nodeState) get(ctx context.Context, o getOpts) (res testResult) {
 func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 	start := time.Now()
 	node := n.nodes[o.NodeIdx]
+	res = testResult{
+		Method: http.MethodHead,
+		Path:   fmt.Sprintf("%s/%s", o.Bucket, o.Object),
+		Node:   n.nodes[o.NodeIdx].endpointURL.Host,
+	}
 	if n.hc.isOffline(node.endpointURL) {
 		res.Offline = true
+		res.Err = errNodeOffline
 		return
 	}
 	opts := minio.StatObjectOptions{}
@@ -439,10 +468,16 @@ func (n *nodeState) stat(ctx context.Context, o statOpts) (res testResult) {
 
 func (n *nodeState) delete(ctx context.Context, o delOpts) (res testResult) {
 	start := time.Now()
-
 	node := n.nodes[o.NodeIdx]
+
+	res = testResult{
+		Method: "DLET",
+		Path:   fmt.Sprintf("%s/%s", o.Bucket, o.Object),
+		Node:   n.nodes[o.NodeIdx].endpointURL.Host,
+	}
 	if n.hc.isOffline(node.endpointURL) {
 		res.Offline = true
+		res.Err = errNodeOffline
 		return
 	}
 	opts := o.RemoveObjectOptions
@@ -458,10 +493,15 @@ func (n *nodeState) delete(ctx context.Context, o delOpts) (res testResult) {
 func (n *nodeState) list(ctx context.Context, o listOpts) (res testResult) {
 
 	start := time.Now()
-
+	res = testResult{
+		Method: "LIST",
+		Path:   fmt.Sprintf("%s/%s", o.Bucket, o.Prefix),
+		Node:   n.nodes[o.NodeIdx].endpointURL.Host,
+	}
 	node := n.nodes[o.NodeIdx]
 	if n.hc.isOffline(node.endpointURL) {
 		res.Offline = true
+		res.Err = errNodeOffline
 		return
 	}
 	doneCh := make(chan struct{})
