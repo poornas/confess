@@ -1,2 +1,2 @@
 # confess
-consistency checker
+object store consistency checker

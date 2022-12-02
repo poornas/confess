@@ -223,67 +223,64 @@ func newKeyMap() keyMap {
 }
 
 type resultsModel struct {
-	metrics  *metrics
-	rows     []table.Row
-	table    table.Model
-	help     help.Model
-	keymap   keyMap
-	nlock    sync.RWMutex
-	nodeMap  map[string]bool
-	quitting bool
-}
+	// metrics *metrics
+	rows    []table.Row
+	table   table.Model
+	help    help.Model
+	keymap  keyMap
+	nlock   sync.RWMutex
+	nodeMap map[string]bool
 
-type opStats struct {
-	total    int
-	failures int
-	lastNode string
-	latency  time.Duration
-}
-type metrics struct {
 	startTime time.Time
-	mutex     sync.RWMutex
-	ops       map[string]opStats
 	numTests  int32
 	numFailed int32
 	lastOp    string
+
+	quitting bool
 }
 
-func (m *metrics) Clone() metrics {
-	ops := make(map[string]opStats, len(m.ops))
-	for k, v := range m.ops {
-		ops[k] = v
-	}
-	// var failures []testResult
-	// failures = append(failures, m.Failures...)
-	return metrics{
-		numTests:  m.numTests,
-		numFailed: m.numFailed,
-		ops:       ops,
-		lastOp:    m.lastOp,
-		startTime: m.startTime,
-	}
-}
-func (m *resultsModel) updateMetrics(msg testResult) {
-	m.metrics.mutex.Lock()
-	defer m.metrics.mutex.Unlock()
-	m.metrics.lastOp = msg.Method
-	stats, ok := m.metrics.ops[msg.Method]
-	if !ok {
-		stats = opStats{}
-	}
-	stats.lastNode = msg.Node
-	stats.latency = msg.Latency
+// type opStats struct {
+// 	total    int
+// 	failures int
+// 	lastNode string
+// 	latency  time.Duration
+// }
+
+// type metrics struct {
+// 	mutex sync.RWMutex
+// 	ops   map[string]opStats
+// }
+
+// func (m *metrics) Clone() metrics {
+// 	ops := make(map[string]opStats, len(m.ops))
+// 	for k, v := range m.ops {
+// 		ops[k] = v
+// 	}
+// 	// var failures []testResult
+// 	// failures = append(failures, m.Failures...)
+// 	return metrics{
+// 		numTests:  m.numTests,
+// 		numFailed: m.numFailed,
+// 		ops:       ops,
+// 		lastOp:    m.lastOp,
+// 		startTime: m.startTime,
+// 	}
+// }
+func (m *resultsModel) updateModel(msg testResult) {
+	m.lastOp = msg.Method
+	atomic.AddInt32(&m.numTests, 1)
 	if msg.Err != nil {
-		stats.failures++
-		atomic.AddInt32(&m.metrics.numFailed, 1)
+		atomic.AddInt32(&m.numFailed, 1)
 		if len(m.rows) < 1000 {
 			m.rows = append(m.rows, msg.toRow())
 		}
 	}
-	stats.total++
-	m.metrics.ops[msg.Method] = stats
-	atomic.AddInt32(&m.metrics.numTests, 1)
-	m.lastFailure = msg
+	m.nlock.Lock() // toggle node online/offline status
+	status, ok := m.nodeMap[msg.Node]
+	if !ok || status != msg.Offline {
+		m.nodeMap[msg.Node] = msg.Offline
+	}
+	m.nlock.Unlock()
 }
 
 func getHeader(ctx *cli.Context) string {
@@ -316,10 +313,11 @@ func initUI() *resultsModel {
 	m := resultsModel{
 		keymap: newKeyMap(),
 		help:   help.New(),
-		metrics: &metrics{
-			ops:       make(map[string]opStats),
-			startTime: time.Now(),
-		},
+		// metrics: &metrics{
+		// 	startTime: time.Now(),
+		// },
+		startTime: time.Now(),
+		nodeMap:   make(map[string]bool),
 	}
 	t := table.New(
 		table.WithColumns(m.getColumns()),
@@ -398,7 +396,7 @@ func (m *resultsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 		}
 	case testResult:
-		m.updateMetrics(msg)
+		m.updateModel(msg)
 		if msg.Final {
 			m.quitting = true
 			return m, nil
@@ -459,16 +457,12 @@ var (
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderTop(true).
 			BorderForeground(subtle)
-	descStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
-		Light: "#B2B2B2",
-		Dark:  "#4A4A4A",
-	})
 )
 
 func (m *resultsModel) View() string {
 	var s strings.Builder
 	s.WriteString(whiteStyle.Render("confess " + version + "\nCopyright MinIO\nGNU AGPL V3\n"))
-	if atomic.LoadInt32(&m.metrics.numTests) == 0 {
+	if atomic.LoadInt32(&m.numTests) == 0 {
 		s.WriteString("(waiting for data)")
 		return s.String()
 	}
@@ -482,7 +476,7 @@ func (m *resultsModel) View() string {
 		s.WriteString(m.helpView())
 	}
 
-	s.WriteString(fmt.Sprintf("\n\n%d operations succeeded, %d failed in %s\n", atomic.LoadInt32(&m.metrics.numTests), atomic.LoadInt32(&m.metrics.numFailed), humanize.RelTime(m.metrics.startTime, time.Now(), "", "")))
+	s.WriteString(fmt.Sprintf("\n\n%d operations succeeded, %d failed in %s\n", atomic.LoadInt32(&m.numTests), atomic.LoadInt32(&m.numFailed), humanize.RelTime(m.startTime, time.Now(), "", "")))
 
 	return s.String()
 }
